@@ -1,0 +1,80 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "vmrebalance.jobName" . }}
+  labels:
+    {{- include "vmrebalance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ .Values.mode }}
+spec:
+  {{- if eq .Values.mode "final" }}
+  # A failed drain check or verify needs a person to look, not a rerun.
+  backoffLimit: 0
+  {{- else }}
+  backoffLimit: {{ .Values.job.backoffLimit }}
+  {{- end }}
+  {{- with .Values.job.activeDeadlineSeconds }}
+  activeDeadlineSeconds: {{ . }}
+  {{- end }}
+  {{- with .Values.job.ttlSecondsAfterFinished }}
+  ttlSecondsAfterFinished: {{ . }}
+  {{- end }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "vmrebalance.labels" . | nindent 8 }}
+        app.kubernetes.io/component: {{ .Values.mode }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "vmrebalance.serviceAccountName" . }}
+      {{- if eq .Values.mode "final" }}
+      restartPolicy: Never
+      {{- else }}
+      # A restarted pod continues with the first unfinished chunk.
+      restartPolicy: OnFailure
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: vmrebalance
+          image: {{ include "vmrebalance.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            {{- include "vmrebalance.args" . | nindent 12 }}
+          {{- if .Values.metrics.enabled }}
+          ports:
+            - name: http-metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

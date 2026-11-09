@@ -1,0 +1,43 @@
+{{- if .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "vmrebalance.fullname" . }}
+  labels:
+    {{- include "vmrebalance.labels" . | nindent 4 }}
+rules:
+  # Read both VMClusters.
+  - apiGroups: [operator.victoriametrics.com]
+    resources: [vmclusters]
+    verbs: [get]
+  # Find the vmstorage, vmselect and vminsert pods; check pod labels against PodDisruptionBudgets.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [list]
+  # Only needed with --access=proxy: reach vmselect and pods through the API server.
+  - apiGroups: [""]
+    resources: [pods/proxy, services/proxy]
+    verbs: [get]
+  # The state: one ConfigMap per migration and tenant, vmrebalance.<from>.<to>[.tenant-<tenant>].
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "vmrebalance.fullname" . }}
+  labels:
+    {{- include "vmrebalance.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "vmrebalance.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "vmrebalance.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

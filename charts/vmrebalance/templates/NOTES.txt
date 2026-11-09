@@ -1,0 +1,21 @@
+{{- $job := include "vmrebalance.jobName" . -}}
+Started the {{ .Values.mode }} Job {{ $job }} for the migration {{ .Values.from }} → {{ .Values.to }}.
+
+Follow it:
+  kubectl -n {{ .Release.Namespace }} logs -f job/{{ $job }}
+
+Progress (state in the ConfigMap vmrebalance.{{ .Values.from }}.{{ .Values.to }}):
+  vmrebalance status -n {{ .Release.Namespace }} --from {{ .Values.from }} --to {{ .Values.to }}
+
+The next upgrade deletes this Job, also while it still runs. Wait until it has finished first:
+  kubectl -n {{ .Release.Namespace }} wait --for=condition=Complete --timeout=-1s job/{{ $job }}
+{{- if eq .Values.mode "sync" }}
+
+Then run a catch-up with
+  helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reset-then-reuse-values
+until a run takes only minutes, switch the aliases to green, and run the final sync with
+  helm upgrade {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} --reset-then-reuse-values --set mode=final --set-string final.cutoverAt=<RFC 3339 time>
+{{- else }}
+
+The Job doesn't restart on failure. Fix the cause, then run the same upgrade again with the same final.cutoverAt.
+{{- end }}

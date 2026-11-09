@@ -1,0 +1,57 @@
+name: helm-ci
+
+on:
+  pull_request:
+    paths:
+      - 'charts/**'
+      - '.github/ct.yaml'
+      - '.github/workflows/helm-ci.yaml'
+
+permissions:
+  contents: read
+
+env:
+  HELM_VERSION: v4.3.1
+  KUBECONFORM_VERSION: v0.8.0
+
+jobs:
+  lint-chart:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: '3.13'
+
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@v2.9.0
+
+      # Lints every changed chart with each of its ci/*-values.yaml files, and checks the version was bumped.
+      - name: Lint
+        run: ct lint --config .github/ct.yaml
+
+      - name: Set up kubeconform
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/bin" kubeconform
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      # Validates the rendered manifests against the Kubernetes schemas. The VMPodScrape CRD has no schema there.
+      - name: Validate manifests
+        run: |
+          for values in charts/vmrebalance/ci/*-values.yaml; do
+            echo "==> $values"
+            helm template vmrebalance charts/vmrebalance --namespace monitoring --values "$values" \
+              | kubeconform -strict -summary -ignore-missing-schemas
+          done

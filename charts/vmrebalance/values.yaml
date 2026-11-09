@@ -1,0 +1,152 @@
+# Default values for vmrebalance. Keys are sorted alphabetically.
+#
+# Every install or upgrade of the release starts one Job, named <release>-<mode>-<revision>:
+# - mode "sync" copies blue's data into green: the first run is the backfill, every later upgrade a catch-up. A
+#   restarted pod continues with the first unfinished chunk, because the state lives in a ConfigMap.
+# - mode "final" runs the final sync after the cutover (set final.cutoverAt). It doesn't restart on failure.
+# An upgrade removes the Job of the previous revision, also while it still runs: wait until it has finished. Use
+# `helm upgrade --reset-then-reuse-values`, so a newer chart version keeps its new defaults. The revision in the Job
+# name needs Helm's own release history (helm, Flux); tools that only run `helm template` (Argo CD) always render
+# revision 1. See docs/usage.md in the repository.
+
+affinity: {}
+
+# Used in both modes.
+copy:
+  # -- Wait before the first retry; it doubles with every further retry.
+  backoff: 1m
+  # -- vmctl workers.
+  concurrency: 2
+  # -- Total transfer rate limit across all vmctl workers, e.g. 50MiB/s. Empty means no limit.
+  rateLimit: 50MiB/s
+  # -- Retries per failed chunk.
+  retries: 3
+  # -- Chunk size. Every finished chunk is recorded, so a restarted run loses at most one chunk.
+  step: 1h
+
+# -- Further arguments for vmrebalance, e.g. ["--verbose"].
+extraArgs: []
+
+# Used with mode "final".
+final:
+  # -- When the aliases were switched to green (RFC 3339). Required with mode "final".
+  cutoverAt: ""
+  # -- Blue must receive no rows for this long (at least 1m, longer than the slowest writer's push interval).
+  drainInterval: 5m
+  # -- How long blue may still receive writes after cutover + 15m.
+  drainTimeout: 20m
+  # -- How far before the last synced point the final window starts.
+  overlap: 1h
+
+# -- Name of the old VMCluster (blue), in the release namespace. Required.
+from: ""
+
+fullnameOverride: ""
+
+image:
+  pullPolicy: IfNotPresent
+  repository: ghcr.io/kokuwaio/victoriametrics-rebalance
+  # -- Image tag. Defaults to v<appVersion>. Until the first release is published, set it to "main".
+  tag: ""
+
+# -- Secrets for pulling the image, e.g. [{name: ghcr}].
+imagePullSecrets: []
+
+job:
+  # -- Stop the Job after this many seconds. Mind the 15m wait, the drain timeout and the copy in mode "final".
+  activeDeadlineSeconds: null
+  # -- Retries of the sync pod (mode "final" never retries).
+  backoffLimit: 10
+  # -- Delete the finished Job after this many seconds. Empty keeps it until the next upgrade.
+  ttlSecondsAfterFinished: null
+
+metrics:
+  # -- Serve the tool's Prometheus metrics (progress, rate limit, blue's load).
+  enabled: true
+  podScrape:
+    # -- Create a VMPodScrape for the VictoriaMetrics operator.
+    enabled: false
+    # -- Scrape interval.
+    interval: 30s
+    # -- Extra labels for the VMPodScrape, e.g. to match a VMAgent's podScrapeSelector.
+    labels: {}
+  # -- Port of the metrics endpoint (container port "http-metrics").
+  port: 8080
+
+# -- "sync" (backfill and catch-up) or "final" (the final sync after the cutover).
+mode: sync
+
+nameOverride: ""
+
+nodeSelector: {}
+
+podAnnotations: {}
+
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+rbac:
+  # -- Create a Role and RoleBinding with the permissions the tool needs in the release namespace.
+  create: true
+
+resources:
+  limits:
+    memory: 1Gi
+  requests:
+    cpu: 500m
+    memory: 256Mi
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+serviceAccount:
+  annotations: {}
+  # -- Mount its token. The tool needs it to read the VMClusters and pods.
+  automount: true
+  # -- Create a ServiceAccount.
+  create: true
+  # -- Name of the ServiceAccount. Defaults to the full name of the release.
+  name: ""
+
+# Used with mode "sync".
+sync:
+  # -- Lower the rate limit while blue's vmselect is busy (needs copy.rateLimit).
+  adaptive: true
+  # -- With adaptive: p99 query latency above which blue counts as busy, e.g. 5s. Empty ignores latency.
+  maxQueryLatency: ""
+  # -- With adaptive: share of blue's vmselect query slots in use above which blue counts as busy.
+  maxSelectUtilization: 0.8
+  # -- With adaptive: the lowest rate. Empty means a tenth of copy.rateLimit.
+  minRateLimit: ""
+  # -- On the first run, start here instead of now - retention (RFC 3339), e.g. for a rollback.
+  since: ""
+  # -- Copy up to this time (RFC 3339). Empty means now. It sticks with --reset-then-reuse-values: reset it for
+  # later catch-up runs.
+  until: ""
+
+# -- Tenant to copy and check, e.g. "0" or "1:2".
+tenant: "0"
+
+# -- Name of the new VMCluster (green), in the release namespace. Required.
+to: ""
+
+tolerations: []
+
+# Verify settings for the final sync.
+verify:
+  # -- Pick the random names from this many names below the top N.
+  pool: 1000
+  # -- Plus this many names picked at random.
+  randomN: 10
+  # -- Share by which green may fall short of blue.
+  tolerance: 0.01
+  # -- Count the samples of this many metric names with the most series.
+  topN: 10

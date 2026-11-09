@@ -1,0 +1,17 @@
+apiVersion: v2
+name: vmrebalance
+description: >-
+  Runs vmrebalance, which moves the data of a VictoriaMetrics cluster to a new cluster with more vmstorage nodes.
+  Every install or upgrade starts one Job: a sync run, or the final sync after the cutover.
+type: application
+home: https://github.com/kokuwaio/victoriametrics-rebalance
+sources:
+  - https://github.com/kokuwaio/victoriametrics-rebalance
+keywords:
+  - victoriametrics
+  - rebalance
+  - migration
+# The chart version. Bump it with every change to the chart.
+version: 0.1.0
+# The vmrebalance release the chart runs by default (image tag v<appVersion>).
+appVersion: "0.1.0"
