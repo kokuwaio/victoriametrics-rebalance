@@ -1,39 +1,100 @@
 # victoriametrics-rebalance
 
 `vmrebalance` moves the data of a VictoriaMetrics cluster to a new cluster with more vmstorage nodes, so that the
-data ends up spread evenly across all of them.
+data ends up spread evenly across all of them, the way the ECK operator moves Elasticsearch data to a new nodeset.
 
-VictoriaMetrics doesn't rebalance existing data when you add a vmstorage node, and moving data between the nodes of
-one cluster isn't safe. So `vmrebalance` does a blue/green migration: you create a second VMCluster ("green") with
-the target number of vmstorage nodes, the tool copies the data from the old one ("blue") through green's vminsert,
-and you switch readers and writers over. [PLAN.md](PLAN.md) explains the design and its trade-offs.
+VictoriaMetrics doesn't rebalance existing data when you add a vmstorage node: vminsert sends new series to the new
+node, but old data stays where it is until retention removes it. Moving data between the nodes of one cluster isn't
+safe, because metricIDs can collide across partitions (upstream issues
+[#2324](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2324) and
+[#10792](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/10792)).
+
+So `vmrebalance` does a blue/green migration:
+
+1. You create a second VMCluster ("green") with the target number of vmstorage nodes.
+2. The tool copies the data from the old cluster ("blue") into green through green's vminsert, which spreads it
+   evenly across all green nodes.
+3. You switch readers and writers to green, the tool runs a last sync, and you delete blue.
 
 The tool never deletes data and never changes VMCluster, VMAgent or Service objects. You make those changes,
 usually in Git. The tool copies the data, checks every step and tells you what's due next.
 
+**Not in scope:** rebalancing in place (blocked inside vmstorage), freeing blue's disks during the migration (blue
+is deleted as a whole at the end), growing PVCs (the operator already supports that), and changing the Kubernetes
+objects for you.
+
+Documentation:
+
+- [docs/architecture.md](docs/architecture.md): how the tool works, with diagrams, design decisions, state, the
+  adaptive rate limit and metrics.
+- [docs/roadmap.md](docs/roadmap.md): what's done, what's next and the open decisions.
+
 ## How a migration runs
+
+```text
+time ─────────────────────────────────────────────────────────────────────────────────────────▶
+                     T0                                    Tc  Tcut
+blue   ═══ reads + writes ═══════════════════════════════════════╪═ soak (no writes) ══ delete
+green                ├─ dual write from vmagent ─────────────────┼═ all reads + writes ═══════▶
+sync   [ backfill: now-retention ── now ][ catch-up ── Tc ]      [ final: Tc-1h ── Tcut+15m ]
+                                                                  └ cache reset, drain check, verify
+```
 
 | Step | Who | What |
 |---|---|---|
-| 1. Prepare | you | Put stable aliases (Services or VMAuth) in front of vmselect and vminsert. See [Requirements](#requirements). |
+| 1. Prepare | you | Put stable aliases (Services or VMAuth) in front of vmselect and vminsert. Done once per setup. See [Requirements](#requirements). |
 | 2. Create green | you | A new VMCluster with more vmstorage nodes, the same version, retention and replication factor, plus `dedup.minScrapeInterval: 1ms` on vmstorage and vmselect. |
-| 3. Dual write | you | Add green as a second `remoteWrite` URL on your VMAgent(s). |
+| 3. Dual write | you | Add green as a second `remoteWrite` URL on your VMAgent(s). Green now receives most new data live. This is T0. |
 | 4. `preflight` | tool | Checks versions, flags, capacity, dual write and pod labels. |
 | 5. `sync` | tool | Backfill: copies `[now - retention, now]` in resumable chunks. This can take hours to days. |
 | 6. `verify` | tool | Compares blue and green per day. |
 | 7. `sync` | tool | Catch-up: copies from the last synced point to now. Repeat until a run takes only minutes. |
-| 8. Cutover | you | Point the read and write aliases at green. |
-| 9. `sync --final` | tool | Copies `[last synced point - 1h, cutover + 15m]`, resets green's rollup cache, checks that blue no longer receives writes, and verifies the copied days. |
-| 10. Delete blue | you | Keep blue for a few days so you can roll back, then delete it and its PVCs. |
+| 8. Cutover | you | Point the read and write aliases at green. This is Tcut. |
+| 9. `sync --final` | tool | Copies `[last synced point - 1h, Tcut + 15m]`, resets green's rollup cache, checks that blue no longer receives writes, and verifies the copied days. |
+| 10. Soak and delete | you | Keep blue for a few days so you can roll back, then delete blue and its PVCs. |
 
-Rollback until step 10: switch the aliases back to blue. To copy data written to green after the cutover back to
-blue, run `sync` with `--from` and `--to` swapped.
+Why dual write *and* a final sync:
+
+- Without dual write, every sample written between the last sync and the cutover would be missing on green until
+  the final sync finishes. Dashboards and alerts would see a gap.
+- Dual write through VMAgent covers most of the data with no gap. The final sync covers everything that doesn't go
+  through VMAgent (vmalert recording rules, OpenTelemetry collectors, jobs that push to `/api/v1/import`), and fills
+  in any samples green dropped during dual write.
+- Overlapping windows are safe because green runs with `-dedup.minScrapeInterval=1ms`, which drops samples that
+  share an exact timestamp. Without it, overlaps would be stored twice and would skew `count_over_time` and similar
+  functions.
+
+Rollback until step 10: switch the aliases back to blue. Blue still has everything up to the cutover. To copy data
+written to green after the cutover back to blue, run `sync` with `--from` and `--to` swapped.
+
+## Requirements
+
+1. **Stable endpoints for readers and writers.** The operator names Services after the VMCluster
+   (`vmselect-<name>`, `vminsert-<name>`), and green has a different name, so clients that use those names can't
+   be switched in one step. Add aliases you control: plain Services such as `vmselect-active` and
+   `vminsert-active` that select `app.kubernetes.io/name: vmselect|vminsert` and
+   `app.kubernetes.io/instance: <active cluster>`, or a VMAuth in front, whose VMUser `targetRefs` point at the
+   alias or the active cluster. The cutover then means changing the alias's selector or target, not every client.
+2. **Know every writer.** Writers that go through VMAgent get dual write. Every other writer (vmalert remote write,
+   OpenTelemetry senders, jobs that push to `/api/v1/import`) is covered only by the final sync, so keep the time
+   between the last catch-up and the cutover short. Or route them through VMAgent, which also accepts
+   `/api/v1/write`, `/api/v1/import/*` and `/opentelemetry/v1/metrics`.
+3. **Green must not block blue.** With `remoteWrite.disableOnDiskQueue`, a slow target can stall writes to all
+   targets. Set `remoteWrite.dropSamplesOnOverload` for the green URL (check that your version allows it per URL),
+   or enable the on-disk queue for the migration. The final sync fills in samples dropped there.
+4. **Pod labels must not overlap.** If blue and green pods share the labels used in `topologySpreadConstraints` or
+   PodDisruptionBudgets (for example a custom `app: vmstorage`), they are counted together: pods can fail to
+   schedule, or evictions can be blocked. Select on `app.kubernetes.io/instance` too. `preflight` checks this.
+5. **Capacity for a full second copy.** Green needs free disk for blue's used bytes plus headroom, and its own
+   vmstorage memory and CPU, until blue is deleted. `preflight` checks the disk.
+6. **Name-agnostic monitoring.** Dashboards, alerts and SLOs that match `job="vmstorage-<name>"` exactly lose green.
+   Use regexes or the instance label.
 
 ## Usage
 
 ```sh
 vmrebalance preflight --namespace monitoring --from vmcluster --to vmcluster-b
-vmrebalance sync      --namespace monitoring --from vmcluster --to vmcluster-b --rate-limit 50MiB/s
+vmrebalance sync      --namespace monitoring --from vmcluster --to vmcluster-b --rate-limit 50MiB/s --adaptive --step 1h
 vmrebalance verify    --namespace monitoring --from vmcluster --to vmcluster-b
 vmrebalance status    --namespace monitoring --from vmcluster --to vmcluster-b
 vmrebalance sync      --namespace monitoring --from vmcluster --to vmcluster-b --final --cutover-at 2026-01-02T10:00:00Z
@@ -41,15 +102,20 @@ vmrebalance sync      --namespace monitoring --from vmcluster --to vmcluster-b -
 
 Run `vmrebalance <command> --help` for all flags. The most important ones:
 
+- `sync --until now|<RFC 3339>`: copy up to this time (default: now).
 - `sync --step 24h`: the chunk size. Every finished chunk is recorded, so a restarted run continues with the first
   unfinished one.
 - `sync --rate-limit 50MiB/s --concurrency 2`: the export reads go through blue's vmselect and vmstorage and compete
   with real queries. Start low and watch blue's load.
+- `sync --adaptive`: halve the rate while blue's vmselect is busy (queries wait for a slot, most slots are in use,
+  or `--max-query-latency` is exceeded), and raise it again when it isn't. The rate changes between chunks, so
+  combine it with a small `--step`. See [docs/architecture.md](docs/architecture.md#adaptive-rate-limit).
+- `sync --metrics-addr :8080`: serve the tool's Prometheus metrics (progress, rate limit, blue's load).
+- `sync --final --cutover-at <time>`: the time you switched the aliases. The final window is measured from it.
+  `--drain-interval` (default 5m) must be longer than the push interval of your slowest writer: blue passes only
+  when it receives no rows at all during one whole interval.
 - `--state-file state.json`: keep the state in a local file instead of the ConfigMap `vmrebalance-<from>-<to>`.
   This is fine on a workstation. A Job needs the ConfigMap, because its pod loses local files when it restarts.
-- `sync --final --cutover-at <time>`: the time you switched the aliases. The final window and the drain check are
-  measured from it. `--drain-interval` (default 5m) must be longer than the push interval of your slowest writer:
-  blue passes only when it receives no rows at all during one whole interval.
 - `--access proxy|direct`: how the tool reaches vmselect and the pods. `proxy` goes through the Kubernetes API
   server and works from any workstation, but the API server cuts requests off after its request timeout (1 minute
   by default), which `verify` can hit on large clusters. `direct` uses Service DNS names and pod IPs. The default
@@ -66,37 +132,34 @@ From a workstation, port-forward both Services and pass `--from-select-url http:
 `--to-insert-url http://localhost:8480`, with `vmctl` in your `PATH`. `preflight`, `verify` and `status` work
 from a workstation without port-forwarding.
 
-## Requirements
-
-1. **Stable endpoints for readers and writers.** The operator names Services after the VMCluster
-   (`vmselect-<name>`, `vminsert-<name>`), so clients that use those names can't be switched in one step. Add
-   aliases you control, for example plain Services that select `app.kubernetes.io/name` and
-   `app.kubernetes.io/instance`, or a VMAuth in front.
-2. **Know every writer.** Writers that go through VMAgent get dual write. Every other writer (vmalert remote write,
-   OpenTelemetry senders, jobs that push to `/api/v1/import`) is covered only by the final sync, so keep the time
-   between the last catch-up and the cutover short, or route them through VMAgent.
-3. **Green must not block blue.** With `remoteWrite.disableOnDiskQueue`, a slow target can stall writes to all
-   targets. Set `remoteWrite.dropSamplesOnOverload` for green, or enable the on-disk queue for the migration.
-4. **Pod labels must not overlap.** PodDisruptionBudgets and `topologySpreadConstraints` that select pods of both
-   clusters count them together. Select on `app.kubernetes.io/instance` too. `preflight` checks this.
-5. **Capacity for a full second copy** of the data, plus green's own memory and CPU, until blue is deleted.
-6. **Name-agnostic monitoring.** Dashboards and alerts that match `job="vmstorage-<name>"` exactly lose green.
-
 ## Checks
 
 - `preflight`:
-  - both clusters are operational, and green has more vmstorage nodes;
+  - both clusters are operational;
+  - green has more vmstorage nodes (otherwise it warns: there is nothing to rebalance);
   - all components run the same image tags (the native format is version-coupled);
   - same retention and replication factor;
   - green deduplicates, with exactly `1ms` (a larger value also merges real samples, so it warns);
   - green's vmstorage nodes have free space for blue's used bytes plus headroom;
-  - green receives live writes, and which share of blue's;
+  - green receives live writes, and which share of blue's (the rest relies on the final sync);
   - no PodDisruptionBudget or topology spread selector matches pods of both clusters.
 - `verify` only reads from the clusters, so it can run at any time, also during a sync. Per UTC day it compares the
   series count from `/api/v1/status/tsdb` and `count_over_time` sample counts for the top N metric names plus a
-  random set. Green passes with at least as many series and samples as blue, minus a tolerance (default 1%).
-- `sync --final`: rollup cache reset on every green vmselect pod; blue's vminsert receives no rows during one
-  `--drain-interval` within `--drain-timeout`; `verify` for the days the final sync copied.
+  random set (counting every series is too expensive on large clusters). Green passes with at least as many series
+  and samples as blue, minus a tolerance (default 1%).
+- `sync --final`: rollup cache reset on every green vmselect pod, so no pod serves results cached before the
+  backfill; blue's vminsert receives no rows during one `--drain-interval` within `--drain-timeout`, otherwise some
+  writer still points at blue; `verify` for the days the final sync copied.
+
+## Risks
+
+- **Copy speed.** A year of retention at several TiB can take days. The final sync must stay short, so the catch-up
+  runs are what keep the cutover window small.
+- **Load on blue.** Export reads go through blue's vmselect and vmstorage and compete with real queries. Use rate
+  limits, `--adaptive` and off-peak hours.
+- **Cost.** A full second copy of the disks, plus vmstorage memory and CPU, for the duration of the migration.
+- **Missed writers.** Anything that bypasses both the aliases and VMAgent writes to blue only, and its data is lost
+  once blue is deleted. The drain check in `sync --final` is what catches it.
 
 ## Development
 
