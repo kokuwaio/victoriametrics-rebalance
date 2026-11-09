@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -100,6 +101,7 @@ func TestVerifyFlagsRejectNegativeCountsAndBadTolerance(t *testing.T) {
 		"negative --pool":     func(v *verifyFlags) { v.Pool = -1 },
 		"tolerance of 100%":   func(v *verifyFlags) { v.Tolerance = 1 },
 		"negative tolerance":  func(v *verifyFlags) { v.Tolerance = -0.1 },
+		"NaN tolerance":       func(v *verifyFlags) { v.Tolerance = math.NaN() },
 	} {
 		v := ok
 		change(&v)

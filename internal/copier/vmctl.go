@@ -81,6 +81,12 @@ func (v *VMCtl) binary() string {
 // requests are spread over the workers. Since one request now covers all series of that hour, blue's vmselect
 // -search.maxExportSeries must be at least the number of series active in an hour.
 func (v *VMCtl) args(w migration.Window, rateLimit int64) []string {
+	// vmctl takes whole seconds (RFC 3339). Round the window out, so the export covers all of it; the overlap with the
+	// next window is safe because green deduplicates.
+	w.Start = w.Start.Truncate(time.Second)
+	if end := w.End.Truncate(time.Second); end.Before(w.End) {
+		w.End = end.Add(time.Second)
+	}
 	args := []string{
 		"vm-native", "-s", "--disable-progress-bar",
 		"--vm-native-src-addr=" + v.SrcAddr,

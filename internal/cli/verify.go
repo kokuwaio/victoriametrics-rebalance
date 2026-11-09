@@ -31,7 +31,8 @@ func (v *verifyFlags) validate() error {
 	if v.TopN < 0 || v.RandomN < 0 || v.Pool < 0 {
 		return errors.New("--top-n, --random-n and --pool must not be negative")
 	}
-	if v.Tolerance < 0 || v.Tolerance >= 1 {
+	// Written as the condition that must hold, so NaN (for which every comparison is false) is rejected too.
+	if !(v.Tolerance >= 0 && v.Tolerance < 1) {
 		return errors.New("--tolerance must be a share between 0 and 1, e.g. 0.01")
 	}
 	return nil

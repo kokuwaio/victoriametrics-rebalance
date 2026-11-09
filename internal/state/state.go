@@ -85,7 +85,7 @@ func (s *State) AddChunk(c Chunk) {
 }
 
 // SetVerification stores the result for the day that starts at day (UTC). A pass replaces an earlier result only if
-// it checked at least the same time range, so a pass for part of the day neither hides a failure elsewhere in the day
+// it checked at least the same time range and wasn't checked before it, so a pass for part of the day neither hides a failure elsewhere in the day
 // nor a whole-day result, which also compared the series count. A failure is always stored; after an earlier
 // failure, its range grows to cover both, so a later pass of only the new range can't hide the earlier one.
 func (s *State) SetVerification(day time.Time, r DayResult) {
@@ -100,10 +100,12 @@ func (s *State) SetVerification(day time.Time, r DayResult) {
 			old.Until = old.From.Add(24 * time.Hour)
 		}
 		switch {
-		case r.Pass && !r.covers(old):
+		case r.Pass && (!r.covers(old) || r.CheckedAt.Before(old.CheckedAt)):
+			// A pass of less, or one checked before the stored result (a slow verify finishing late), changes nothing.
 			return
 		case !r.Pass && !old.Pass:
 			r.From, r.Until = minTime(r.From, old.From), maxTime(r.Until, old.Until)
+			r.CheckedAt = maxTime(r.CheckedAt, old.CheckedAt)
 			for _, p := range old.Problems {
 				if !slices.Contains(r.Problems, p) {
 					r.Problems = append(r.Problems, p)

@@ -154,3 +154,22 @@ func TestCopySplitsTheRateLimitAcrossTheBusyWorkers(t *testing.T) {
 		}
 	}
 }
+
+func TestCopyRoundsTheWindowOutToWholeSeconds(t *testing.T) {
+	r := &fakeRunner{}
+	v := &copier.VMCtl{SrcAddr: "s", DstAddr: "d", Run: r.run}
+	w := migration.Window{
+		Start: time.Date(2026, 1, 2, 10, 0, 0, 700_000_000, time.UTC),
+		End:   time.Date(2026, 1, 2, 11, 30, 5, 250_000_000, time.UTC),
+	}
+
+	if _, err := v.Copy(t.Context(), w, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{"--vm-native-filter-time-start=2026-01-02T10:00:00Z", "--vm-native-filter-time-end=2026-01-02T11:30:06Z"} {
+		if !slices.Contains(r.args, want) {
+			t.Errorf("args %q lack %s: the export must cover the whole recorded window", r.args, want)
+		}
+	}
+}

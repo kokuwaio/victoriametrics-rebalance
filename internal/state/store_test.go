@@ -286,3 +286,24 @@ func TestAResultWithoutARangeCountsAsTheWholeDay(t *testing.T) {
 		t.Errorf("a whole-day pass must replace a failure saved without a range: %+v", got)
 	}
 }
+
+func TestAnOlderPassDoesNotReplaceANewerFailure(t *testing.T) {
+	day := synced
+	whole := func(pass bool, checked time.Time) state.DayResult {
+		return state.DayResult{Pass: pass, From: day, Until: day.Add(24 * time.Hour), CheckedAt: checked}
+	}
+	s := &state.State{}
+	s.SetVerification(day, whole(false, day.Add(30*time.Hour)))
+
+	// A verify that started earlier finishes later and saves its pass.
+	s.SetVerification(day, whole(true, day.Add(29*time.Hour)))
+
+	if got := s.Verifications[state.DayKey(day)]; got.Pass {
+		t.Errorf("an older pass replaced a newer failure: %+v", got)
+	}
+
+	s.SetVerification(day, whole(false, day.Add(28*time.Hour)))
+	if got := s.Verifications[state.DayKey(day)]; !got.CheckedAt.Equal(day.Add(30 * time.Hour)) {
+		t.Errorf("CheckedAt = %v, want the newest check time kept", got.CheckedAt)
+	}
+}

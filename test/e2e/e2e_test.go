@@ -65,11 +65,14 @@ func TestMigration(t *testing.T) {
 		if !strings.Contains(e.jobLogs, "serving metrics") {
 			t.Error("the sync Job didn't start its metrics server")
 		}
-		blue := e.query("blue", `sum(count_over_time(e2e_history[4d]))`, at)
-		green := e.query("green", `sum(count_over_time(e2e_history[4d]))`, at)
-		if blue == 0 || green != blue {
-			t.Errorf("samples of e2e_history: blue %.0f, green %.0f", blue, green)
-		}
+		// The Job is done once vmctl has sent the rows; green makes them searchable shortly after.
+		const samples = `sum(count_over_time(e2e_history[4d]))`
+		var blue, green float64
+		e.eventually("green has all of blue's samples", time.Minute, func() bool {
+			blue, green = e.query("blue", samples, at), e.query("green", samples, at)
+			return blue > 0 && green == blue
+		})
+		t.Logf("samples of e2e_history: blue %.0f, green %.0f", blue, green)
 		for _, pod := range []string{"vmstorage-green-0", "vmstorage-green-1"} {
 			if rows := e.storageRows(pod); rows == 0 {
 				t.Errorf("%s holds no rows: the data was not spread across green's nodes", pod)
