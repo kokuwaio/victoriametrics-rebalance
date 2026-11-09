@@ -107,14 +107,20 @@ func (f *fakeCluster) setDisk(used, free int) {
 }
 
 // setInserted makes the vminsert pods report successive vm_rows_inserted_total counters: live rows (remote write)
-// and native rows (imports, as the tool's own sync does).
+// and native rows (imports, as the tool's own sync does). The pods never restart.
 func (f *fakeCluster) setInserted(live, native []int) {
+	f.setInsertedWithStarts(live, native, make([]int, len(live)))
+}
+
+// setInsertedWithStarts is setInserted with a vm_app_start_timestamp per scrape.
+func (f *fakeCluster) setInsertedWithStarts(live, native, started []int) {
 	for _, p := range f.pods[cluster.Insert] {
 		var bodies []string
 		for i := range live {
 			bodies = append(bodies, fmt.Sprintf(
-				"vm_rows_inserted_total{type=\"promremotewrite\"} %d\nvm_rows_inserted_total{type=\"native\"} %d\n",
-				live[i], native[i]))
+				"vm_rows_inserted_total{type=\"promremotewrite\"} %d\nvm_rows_inserted_total{type=\"native\"} %d\n"+
+					"vm_app_start_timestamp %d\n",
+				live[i], native[i], started[i]))
 		}
 		f.podResp[p.Name+"/metrics"] = bodies
 	}

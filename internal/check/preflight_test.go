@@ -96,6 +96,10 @@ func TestPreflightFindsProblems(t *testing.T) {
 		}, check.Dedup, check.Warn, "30s"},
 		{"too little free disk on green", func(_, g *fakeCluster) { g.setDisk(0, 200) },
 			check.Capacity, check.Fail, "600 B free"},
+		{"one green node too small for its share", func(_, g *fakeCluster) {
+			g.setDisk(0, 2000)
+			g.podResp["vmstorage-green-0/metrics"] = []string{"vm_free_disk_space_bytes{path=\"/vm-data\"} 100\n"}
+		}, check.Capacity, check.Fail, "vmstorage-green-0 (100 B free)"},
 		{"no running blue vmstorage pods", func(b, _ *fakeCluster) { b.pods[cluster.Storage] = nil },
 			check.Capacity, check.Fail, "no running vmstorage pods"},
 		{"no dual write, only the tool's imports", func(_, g *fakeCluster) { g.setInserted([]int{500, 500}, []int{0, 5000}) },

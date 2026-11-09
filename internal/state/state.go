@@ -55,6 +55,8 @@ type DayResult struct {
 	GreenSeries int64     `json:"greenSeries"`
 	Problems    []string  `json:"problems,omitempty"`
 	CheckedAt   time.Time `json:"checkedAt"`
+	// Partial is true when only part of the day was checked (sample counts only, no series count).
+	Partial bool `json:"partial,omitempty"`
 }
 
 // AddChunk appends a finished chunk, moves SyncedUntil forward and trims the history to MaxChunks.
@@ -68,10 +70,14 @@ func (s *State) AddChunk(c Chunk) {
 	}
 }
 
-// SetVerification stores the result for the day that starts at day (UTC).
+// SetVerification stores the result for the day that starts at day (UTC). A passing check of only part of the day
+// doesn't replace a result for the whole day, which also compared the series count.
 func (s *State) SetVerification(day time.Time, r DayResult) {
 	if s.Verifications == nil {
 		s.Verifications = map[string]DayResult{}
+	}
+	if old, ok := s.Verifications[DayKey(day)]; ok && !old.Partial && r.Partial && r.Pass {
+		return
 	}
 	s.Verifications[DayKey(day)] = r
 }

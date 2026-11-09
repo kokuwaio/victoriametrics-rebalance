@@ -36,7 +36,7 @@ time ─────────────────────────
                      T0                                    Tc  Tcut
 blue   ═══ reads + writes ═══════════════════════════════════════╪═ soak (no writes) ══ delete
 green                ├─ dual write from vmagent ─────────────────┼═ all reads + writes ═══════▶
-sync   [ backfill: now-retention ── now ][ catch-up ── Tc ]      [ final: Tc-1h ── drained ]
+sync   [ backfill: now-retention ── now ][ catch-up ── Tc ]      [ final: Tc-overlap ── drained ]
                                                                   └ drain check first, then copy, cache reset, verify
 ```
 
@@ -50,7 +50,7 @@ sync   [ backfill: now-retention ── now ][ catch-up ── Tc ]      [ final
 | 6. `verify` | tool | Compares blue and green per day. |
 | 7. `sync` | tool | Catch-up: copies from the last synced point to now. Repeat until a run takes only minutes. |
 | 8. Cutover | you | Point the read and write aliases at green. This is Tcut. |
-| 9. `sync --final` | tool | Waits until `Tcut + 15m` and checks that blue no longer receives writes (if it still does, it stops without copying). Then copies `[last synced point - 1h, the moment blue was drained]` (from `Tcut - 1h` if a catch-up already ran past the cutover), resets green's rollup cache, and verifies the copied days. |
+| 9. `sync --final` | tool | Waits until `Tcut + 15m` and checks that blue no longer receives writes (if it still does, it stops without copying). Then copies `[last synced point - --final-overlap (1h), the moment blue was drained]` (from `Tcut - --final-overlap` if a catch-up already ran past the cutover), resets green's rollup cache, and verifies the copied days. |
 | 10. Soak and delete | you | Keep blue for a few days so you can roll back, then delete blue and its PVCs. |
 
 Why dual write *and* a final sync:
@@ -80,7 +80,10 @@ state and would copy green's whole retention.
 2. **Know every writer.** Writers that go through VMAgent get dual write. Every other writer (vmalert remote write,
    OpenTelemetry senders, jobs that push to `/api/v1/import`) is covered only by the final sync, so keep the time
    between the last catch-up and the cutover short. Or route them through VMAgent, which also accepts
-   `/api/v1/write`, `/api/v1/import/*` and `/opentelemetry/v1/metrics`.
+   `/api/v1/write`, `/api/v1/import/*` and `/opentelemetry/v1/metrics`. If such a writer sends samples with old
+   timestamps (for example a job that imports yesterday's data), the final sync reaches back only `--final-overlap`
+   before the last synced point, and catch-up runs don't overlap. So set `--final-overlap` to at least how far back
+   such a writer backdates plus how long the catch-up phase ran.
 3. **Green must not block blue.** With `remoteWrite.disableOnDiskQueue`, a slow target can stall writes to all
    targets. Set `remoteWrite.dropSamplesOnOverload` for the green URL (check that your version allows it per URL),
    or enable the on-disk queue for the migration. The final sync fills in samples dropped there.
@@ -110,13 +113,15 @@ Run `vmrebalance <command> --help` for all flags. The most important ones:
   unfinished one.
 - `sync --rate-limit 50MiB/s --concurrency 2`: the export reads go through blue's vmselect and vmstorage and compete
   with real queries. Start low and watch blue's load. The limit is the total: vmctl applies its rate limit per
-  worker, so the tool divides it by `--concurrency`.
+  request, and the tool runs one request per hour of the chunk on `--concurrency` workers, so it divides the limit
+  by the number of requests that run at once.
 - `sync --adaptive`: halve the rate while blue's vmselect is busy (queries wait for a slot, or most slots are in use),
   and raise it again when it isn't. Latency counts only if you set `--max-query-latency`, e.g. `5s`; it is off by
   default. The rate changes between chunks, so combine it with a small `--step`. See
   [docs/architecture.md](docs/architecture.md#adaptive-rate-limit).
 - `sync --metrics-addr :8080`: serve the tool's Prometheus metrics (progress, rate limit, blue's load).
 - `sync --final --cutover-at <time>`: the time you switched the aliases. The final window is measured from it.
+  `--final-overlap` (default 1h) is how far before the last synced point the final window starts.
   `--drain-interval` (default 5m) must be longer than the push interval of your slowest writer: blue passes only
   when it receives no rows at all during one whole interval.
 - `--state-file state.json`: keep the state in a local file instead of the ConfigMap `vmrebalance-<from>-<to>`
@@ -153,8 +158,8 @@ from a workstation without port-forwarding.
 - `verify` only reads from the clusters, so it can run at any time, also during a sync. Per UTC day it compares the
   series count from `/api/v1/status/tsdb` and `count_over_time` sample counts for the top N metric names plus a
   random set (counting every series is too expensive on large clusters). Green passes with at least as many series
-  and samples as blue, minus a tolerance (default 1%). On the last, partial day only the sample counts are compared,
-  because the day's series count also includes series written after the last synced point.
+  and samples as blue, minus a tolerance (default 1%). On a partial first or last day only the sample counts within
+  the range are compared, because the day's series count also includes series outside it.
 - `sync --final`: before copying, blue's vminsert receives no rows during one `--drain-interval` within
   `--drain-timeout`, otherwise some writer still points at blue (a window in which a vminsert pod restarted counts
   as unknown and is measured again); rollup cache reset on every green vmselect pod, so no pod serves results
@@ -164,6 +169,9 @@ from a workstation without port-forwarding.
 
 - **Copy speed.** A year of retention at several TiB can take days. The final sync must stay short, so the catch-up
   runs are what keep the cutover window small.
+- **Series per export.** Each vmctl request exports all series of one hour, so blue's vmselect needs
+  `-search.maxExportSeries` (default 10 million) at least as high as the series active in an hour. Otherwise every
+  chunk fails with an error that names the limit.
 - **Load on blue.** Export reads go through blue's vmselect and vmstorage and compete with real queries. Use rate
   limits, `--adaptive` and off-peak hours.
 - **Cost.** A full second copy of the disks, plus vmstorage memory and CPU, for the duration of the migration.

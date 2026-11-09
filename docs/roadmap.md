@@ -12,8 +12,9 @@
 
 ## Open decisions
 
-- **Chunk size.** One day is the default. Large clusters may need one hour, or chunks per metric name. With
-  `--adaptive`, smaller chunks react faster to load on blue. Decide after milestone 1.
+- **Chunk size.** One day is the default. Large clusters may need one hour. Splitting per metric name (vmctl's
+  per-metric mode) is off, because its metric discovery accepts partial results. With `--adaptive`, smaller chunks
+  react faster to load on blue. Decide after milestone 1.
 - **Adaptive rate within a chunk.** vmctl reads its rate limit once per run, so `--adaptive` can only change the
   rate between chunks. A copy engine written in Go could throttle continuously.
 - **Should the tool create green?** For now it doesn't, because a GitOps repository owns the objects. Revisit with

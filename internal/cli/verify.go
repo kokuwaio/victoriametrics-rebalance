@@ -121,16 +121,17 @@ func verifyDays(ctx context.Context, e *env, v verifyFlags, from, to time.Time) 
 	var days []time.Time
 	var dayResults []state.DayResult
 	for d := from.UTC().Truncate(day); d.Before(to); d = d.Add(day) {
-		end := minTime(d.Add(day), to)
-		e.log.Info("verifying", "day", state.DayKey(d), "until", end.UTC().Format(time.RFC3339))
-		r := check.VerifyDay(ctx, e.blue, e.green, d, end, v.VerifyOptions)
+		start, end := maxTime(d, from), minTime(d.Add(day), to)
+		e.log.Info("verifying", "day", state.DayKey(d), "from", start.UTC().Format(time.RFC3339), "until", end.UTC().Format(time.RFC3339))
+		r := check.VerifyDay(ctx, e.blue, e.green, start, end, v.VerifyOptions)
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		days, dayResults = append(days, d), append(dayResults, r)
 		msg := fmt.Sprintf("series: blue %d, green %d", r.BlueSeries, r.GreenSeries)
-		if end.Before(d.Add(day)) {
-			msg = fmt.Sprintf("samples up to %s match (partial day, series not compared)", end.UTC().Format(time.TimeOnly))
+		if r.Partial {
+			msg = fmt.Sprintf("samples %s–%s match (partial day, series not compared)",
+				start.UTC().Format(time.TimeOnly), end.UTC().Format(time.TimeOnly))
 		}
 		res := check.Result{Name: "verify " + state.DayKey(d), Level: check.Pass, Message: msg}
 		if !r.Pass {

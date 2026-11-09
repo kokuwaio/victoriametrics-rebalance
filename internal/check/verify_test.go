@@ -191,3 +191,19 @@ func TestVerifyDayPartialDaySkipsTheWholeDaySeriesCount(t *testing.T) {
 		t.Errorf("want pass on a partial day with equal samples, got %v", r.Problems)
 	}
 }
+
+func TestVerifyDayCountsOnlyFromStartWhenTheRangeBeginsMidDay(t *testing.T) {
+	// Only 12:00–13:00 was copied; blue has more series that day, which green never got.
+	b, g := newSelect(1000, allCounts), newSelect(900, allCounts)
+	blue, green := clustersWith(b, g)
+
+	r := check.VerifyDay(t.Context(), blue, green, day.Add(12*time.Hour), day.Add(13*time.Hour), withRand())
+
+	if !r.Pass {
+		t.Errorf("want pass, got %v", r.Problems)
+	}
+	q := g.queries[0]
+	if !strings.Contains(q.Get("query"), "[3600s]") || q.Get("time") != "1767358800" {
+		t.Errorf("query = %v, want a 1h window ending at 13:00", q)
+	}
+}

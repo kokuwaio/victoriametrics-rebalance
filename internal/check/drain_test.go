@@ -102,3 +102,16 @@ func TestDrainReportsTheWriterWhenTheLastMeasurementIsIncomplete(t *testing.T) {
 		t.Errorf("drain = %s %q, want the writer's 10 rows/s, not an unknown result", res.Level, res.Message)
 	}
 }
+
+func TestDrainDetectsARestartAlthoughTheCounterGrewBackPastItsOldValue(t *testing.T) {
+	blue := newCluster("blue", 2)
+	// The pod restarted at second 2000 and received 1000 rows since: the counter looks unchanged.
+	blue.setInsertedWithStarts([]int{1000, 1000, 1000, 1000, 1000, 1000}, []int{0, 0, 0, 0, 0, 0},
+		[]int{1000, 2000, 2000, 3000, 3000, 4000})
+
+	res := check.WaitDrained(t.Context(), blue, drainOpts)
+
+	if res.Level != check.Fail || !strings.Contains(res.Message, "restarted") {
+		t.Errorf("drain = %s %q, want an unknown result because the pod restarted in every window", res.Level, res.Message)
+	}
+}

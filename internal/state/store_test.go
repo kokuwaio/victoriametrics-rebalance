@@ -181,6 +181,11 @@ func TestEachTenantHasItsOwnState(t *testing.T) {
 	if name := state.Name(other); name != "vmrebalance-blue-green-1-2" {
 		t.Errorf("name = %s", name)
 	}
+	for tenant, want := range map[string]string{"0:0": "vmrebalance-blue-green", "": "vmrebalance-blue-green", "1:0": "vmrebalance-blue-green-1"} {
+		if name := state.Name(state.Migration{From: "blue", To: "green", Tenant: tenant}); name != want {
+			t.Errorf("tenant %q: name = %s, want %s (the same tenant as its short form)", tenant, name, want)
+		}
+	}
 
 	path := filepath.Join(t.TempDir(), "state.json")
 	if _, err := state.NewFile(path, bg).Update(t.Context(), func(st *state.State) { st.SyncedUntil = synced }); err != nil {
@@ -188,5 +193,20 @@ func TestEachTenantHasItsOwnState(t *testing.T) {
 	}
 	if _, err := state.NewFile(path, other).Load(t.Context()); err == nil || !strings.Contains(err.Error(), "tenant 0") {
 		t.Errorf("loading tenant 0's state file as tenant 1:2: err = %v, want a mismatch error", err)
+	}
+}
+
+func TestAPartialPassDoesNotHideAFullDayResult(t *testing.T) {
+	s := &state.State{}
+	s.SetVerification(synced, state.DayResult{Pass: false, Problems: []string{"series: blue 10, green 9"}})
+
+	s.SetVerification(synced, state.DayResult{Pass: true, Partial: true})
+	if got := s.Verifications[state.DayKey(synced)]; got.Pass {
+		t.Errorf("a pass for 23:00–24:00 replaced the failed whole-day check: %+v", got)
+	}
+
+	s.SetVerification(synced, state.DayResult{Pass: true})
+	if got := s.Verifications[state.DayKey(synced)]; !got.Pass {
+		t.Errorf("a new whole-day pass must replace the failure: %+v", got)
 	}
 }

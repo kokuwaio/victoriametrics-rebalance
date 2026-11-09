@@ -72,6 +72,14 @@ func (v *VMCtl) binary() string {
 	return v.Binary
 }
 
+// args builds the vmctl command line.
+//
+// vmctl's default per-metric mode first lists the metric names through /api/v1/label/__name__/values, which
+// vmselect answers with a partial result when a vmstorage node is unavailable; vmctl then copies only the names it
+// found, or nothing, and still succeeds. So the tool disables per-metric migration: every request exports all series
+// of one hour of the window, and vmselect fails a native export instead of returning a partial one. The hourly
+// requests are spread over the workers. Since one request now covers all series of that hour, blue's vmselect
+// -search.maxExportSeries must be at least the number of series active in an hour.
 func (v *VMCtl) args(w migration.Window, rateLimit int64) []string {
 	args := []string{
 		"vm-native", "-s", "--disable-progress-bar",
@@ -80,6 +88,8 @@ func (v *VMCtl) args(w migration.Window, rateLimit int64) []string {
 		`--vm-native-filter-match={__name__!=""}`,
 		"--vm-native-filter-time-start=" + w.Start.UTC().Format(time.RFC3339),
 		"--vm-native-filter-time-end=" + w.End.UTC().Format(time.RFC3339),
+		"--vm-native-disable-per-metric-migration",
+		"--vm-native-step-interval=hour",
 	}
 	workers := vmctlDefaultConcurrency
 	if v.Concurrency > 0 {
@@ -87,9 +97,11 @@ func (v *VMCtl) args(w migration.Window, rateLimit int64) []string {
 		args = append(args, "--vm-concurrency="+strconv.Itoa(v.Concurrency))
 	}
 	if rateLimit > 0 {
-		// vmctl applies --vm-rate-limit to each worker's request, not to the whole process.
-		perWorker := max(1, rateLimit/int64(workers))
-		args = append(args, "--vm-rate-limit="+strconv.FormatInt(perWorker, 10))
+		// vmctl applies --vm-rate-limit to each request, not to the whole process. Each worker runs one hourly
+		// request at a time, so at most min(workers, hours) requests run at once.
+		hours := max(1, int((w.End.Sub(w.Start)+time.Hour-1)/time.Hour))
+		perRequest := max(1, rateLimit/int64(min(workers, hours)))
+		args = append(args, "--vm-rate-limit="+strconv.FormatInt(perRequest, 10))
 	}
 	return append(args, v.ExtraArgs...)
 }

@@ -3,6 +3,7 @@ package check
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -197,6 +198,20 @@ func capacity(ctx context.Context, r *Report, blue, green cluster.Client, headro
 	if f < need {
 		r.add(Capacity, Fail, "green has %s free, blue uses %s; green needs %s with %.0f%% headroom",
 			FormatBytes(f), FormatBytes(u), FormatBytes(need), headroom*100)
+		return
+	}
+	// vminsert spreads series evenly, so every green node receives about the same share. A node that can't hold
+	// its share fills up and turns read-only although the total would fit.
+	share := need / float64(len(free))
+	var small []string
+	for _, pod := range slices.Sorted(maps.Keys(free)) {
+		if free[pod] < share {
+			small = append(small, fmt.Sprintf("%s (%s free)", pod, FormatBytes(free[pod])))
+		}
+	}
+	if len(small) > 0 {
+		r.add(Capacity, Fail, "each green node needs %s for its share of blue's %s with %.0f%% headroom; too small: %s",
+			FormatBytes(share), FormatBytes(u), headroom*100, strings.Join(small, ", "))
 		return
 	}
 	r.add(Capacity, Pass, "green has %s free, blue uses %s", FormatBytes(f), FormatBytes(u))

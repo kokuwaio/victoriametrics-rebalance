@@ -26,6 +26,7 @@ type syncOptions struct {
 	step         time.Duration
 	retries      int
 	backoff      time.Duration
+	finalOverlap time.Duration
 
 	vmctl       string
 	vmctlArgs   []string
@@ -56,10 +57,10 @@ The first run starts at now - retention. Later runs continue from the last finis
 sync (catch-up) until one run takes only minutes, then switch the read and write aliases to green.
 
 sync --final runs after the cutover. It waits until cutover + 15m and checks that blue no longer receives writes;
-if it still does, it stops without copying. Then it copies [last synced point - 1h, the moment blue was drained]
-(from cutover - 1h if a catch-up already ran past the cutover), resets the rollup result cache on every green
-vmselect pod, and verifies the days it copied. A rerun with the same --cutover-at covers the first run's window
-again.`,
+if it still does, it stops without copying. Then it copies [last synced point - --final-overlap (1h), the moment
+blue was drained] (from the cutover - --final-overlap if a catch-up already ran past the cutover), resets
+the rollup result cache on every green vmselect pod, and verifies the days it copied. A rerun with the same
+--cutover-at covers the first run's window again.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runSync(cmd, g, o)
 		},
@@ -72,6 +73,7 @@ again.`,
 	f.DurationVar(&o.step, "step", 24*time.Hour, "chunk size")
 	f.IntVar(&o.retries, "retries", 3, "retries per failed chunk")
 	f.DurationVar(&o.backoff, "backoff", time.Minute, "wait before the first retry; doubles with every further retry")
+	f.DurationVar(&o.finalOverlap, "final-overlap", migration.DefaultFinalOverlap, "with --final: start this long before the last synced point; must cover the oldest timestamps that writers bypassing dual write still send")
 	f.StringVar(&o.vmctl, "vmctl", "vmctl", "path to the vmctl binary")
 	f.StringArrayVar(&o.vmctlArgs, "vmctl-arg", nil, "extra argument for vmctl, e.g. --vmctl-arg=--vm-native-disable-http-keep-alive (repeatable)")
 	f.IntVar(&o.concurrency, "concurrency", 2, "vmctl import workers (--vm-concurrency)")
@@ -99,6 +101,9 @@ func runSync(cmd *cobra.Command, g *globalOptions, o *syncOptions) error {
 	if o.final {
 		if err := o.verify.validate(); err != nil {
 			return err
+		}
+		if o.finalOverlap <= 0 {
+			return errors.New("--final-overlap must be positive")
 		}
 	}
 	for _, a := range o.vmctlArgs {
@@ -186,15 +191,16 @@ func newSyncer(cmd *cobra.Command, e *env, o *syncOptions, m *migration.Metrics)
 			ExtraArgs:   o.vmctlArgs,
 			Output:      cmd.ErrOrStderr(),
 		},
-		Pacer:   pacer,
-		Metrics: m,
-		Store:   e.store,
-		Step:    o.step,
-		Retries: o.retries,
-		Backoff: o.backoff,
-		Now:     time.Now,
-		Sleep:   sleep,
-		Log:     e.log,
+		Pacer:        pacer,
+		Metrics:      m,
+		Store:        e.store,
+		Step:         o.step,
+		Retries:      o.retries,
+		Backoff:      o.backoff,
+		FinalOverlap: o.finalOverlap,
+		Now:          time.Now,
+		Sleep:        sleep,
+		Log:          e.log,
 	}, nil
 }
 
@@ -299,6 +305,13 @@ func runFinal(ctx context.Context, e *env, o *syncOptions, syncer *migration.Syn
 	}
 	fmt.Fprintln(e.out, "\nDone. Keep blue for a few days so you can roll back, then delete it and its PVCs.")
 	return nil
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 func minTime(a, b time.Time) time.Time {

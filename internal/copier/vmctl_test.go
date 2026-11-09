@@ -51,6 +51,8 @@ func TestCopyRunsVMCtlNativeModeForTheWindow(t *testing.T) {
 		`--vm-native-filter-match={__name__!=""}`,
 		"--vm-native-filter-time-start=2026-01-02T00:00:00Z",
 		"--vm-native-filter-time-end=2026-01-03T00:00:00Z",
+		"--vm-native-disable-per-metric-migration",
+		"--vm-native-step-interval=hour",
 		"--vm-concurrency=2",
 		"--vm-rate-limit=26214400", // 50 MiB/s split across 2 workers
 	}
@@ -127,24 +129,28 @@ func TestParseRate(t *testing.T) {
 	}
 }
 
-func TestCopySplitsTheRateLimitAcrossVMCtlsWorkers(t *testing.T) {
+func TestCopySplitsTheRateLimitAcrossTheBusyWorkers(t *testing.T) {
+	short := migration.Window{Start: window.Start, End: window.Start.Add(90 * time.Minute)}
 	for _, tc := range []struct {
+		name        string
+		w           migration.Window
 		concurrency int
 		want        string
 	}{
-		{0, "--vm-rate-limit=500"}, // vmctl's default of 2 workers
-		{4, "--vm-rate-limit=250"},
-		{2000, "--vm-rate-limit=1"},
+		{"vmctl's default of 2 workers", window, 0, "--vm-rate-limit=500"},
+		{"4 workers", window, 4, "--vm-rate-limit=250"},
+		{"more workers than hours: only 24 hourly requests run at once", window, 100, "--vm-rate-limit=41"},
+		{"90 minutes are 2 hourly requests", short, 8, "--vm-rate-limit=500"},
 	} {
 		r := &fakeRunner{}
 		v := &copier.VMCtl{SrcAddr: "s", DstAddr: "d", Concurrency: tc.concurrency, Run: r.run}
 
-		if _, err := v.Copy(t.Context(), window, 1000); err != nil {
+		if _, err := v.Copy(t.Context(), tc.w, 1000); err != nil {
 			t.Fatal(err)
 		}
 
 		if !slices.Contains(r.args, tc.want) {
-			t.Errorf("concurrency %d: args %q lack %s", tc.concurrency, r.args, tc.want)
+			t.Errorf("%s: args %q lack %s", tc.name, r.args, tc.want)
 		}
 	}
 }

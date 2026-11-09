@@ -37,11 +37,13 @@ type Migration struct {
 	Tenant string
 }
 
+// tenant returns the tenant in its shortest form: VictoriaMetrics treats "" and "0:0" as "0", and "1:0" as "1".
 func (m Migration) tenant() string {
-	if m.Tenant == "" {
+	t := strings.TrimSuffix(m.Tenant, ":0")
+	if t == "" {
 		return "0"
 	}
-	return m.Tenant
+	return t
 }
 
 // empty returns the state of a migration that hasn't saved anything yet.

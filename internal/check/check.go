@@ -67,19 +67,31 @@ type Sleeper func(ctx context.Context, d time.Duration) error
 // insertRate measures the rows per second a cluster's vminsert pods accept, from two scrapes of
 // vm_rows_inserted_total window apart. keep filters the counters by their labels (nil keeps all).
 //
-// Pods that restarted between the scrapes (counter went down) or appeared or vanished in between are left out of
-// the rate, and complete is false: what those pods received is unknown, so a rate of 0 doesn't prove there were no
-// writes.
+// Pods that restarted between the scrapes (another vm_app_start_timestamp, or the counter went down) or appeared or
+// vanished in between are left out of the rate, and complete is false: what those pods received is unknown, so a
+// rate of 0 doesn't prove there were no writes.
 func insertRate(ctx context.Context, c cluster.Client, window time.Duration, sleep Sleeper,
 	keep func(map[string]string) bool) (rate float64, complete bool, err error) {
-	before, err := scrape(ctx, c, cluster.Insert, rowsInserted, keep)
+	type reading struct{ rows, started float64 }
+	read := func() (map[string]reading, error) {
+		samples, err := scrapeAll(ctx, c, cluster.Insert)
+		if err != nil {
+			return nil, err
+		}
+		out := map[string]reading{}
+		for pod, s := range samples {
+			out[pod] = reading{rows: vm.Sum(s, rowsInserted, keep), started: vm.Sum(s, appStarted, nil)}
+		}
+		return out, nil
+	}
+	before, err := read()
 	if err != nil {
 		return 0, false, err
 	}
 	if err := sleep(ctx, window); err != nil {
 		return 0, false, err
 	}
-	after, err := scrape(ctx, c, cluster.Insert, rowsInserted, keep)
+	after, err := read()
 	if err != nil {
 		return 0, false, err
 	}
@@ -87,14 +99,17 @@ func insertRate(ctx context.Context, c cluster.Client, window time.Duration, sle
 	complete = len(before) == len(after)
 	for pod, a := range after {
 		b, ok := before[pod]
-		if !ok || a < b {
+		if !ok || a.started != b.started || a.rows < b.rows {
 			complete = false
 			continue
 		}
-		rows += a - b
+		rows += a.rows - b.rows
 	}
 	return rows / window.Seconds(), complete, nil
 }
+
+// appStarted is when a VictoriaMetrics process started (Unix seconds).
+const appStarted = "vm_app_start_timestamp"
 
 // scrape reads /metrics from every running pod of a component and returns, per pod name, the sum of the samples
 // named metric that keep accepts (nil keeps all).

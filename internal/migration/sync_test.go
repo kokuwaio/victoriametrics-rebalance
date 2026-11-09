@@ -442,3 +442,31 @@ type copierFunc func(context.Context, migration.Window, int64) (migration.CopySt
 func (f copierFunc) Copy(ctx context.Context, w migration.Window, r int64) (migration.CopyStats, error) {
 	return f(ctx, w, r)
 }
+
+func TestFinalOverlapReachesBackForWritersThatSendOldSamples(t *testing.T) {
+	st := &state.Memory{}
+	_, _ = st.Update(t.Context(), func(s *state.State) { s.SyncedUntil = ts("2026-01-05T10:20:00Z") })
+	s := newSyncer(&fakeCopier{}, st, ts("2026-01-05T11:00:00Z"))
+	// A job imports yesterday's samples, so the final sync must cover a day before the last synced point.
+	s.FinalOverlap = 24 * time.Hour
+
+	w, err := s.Final(t.Context(), ts("2026-01-05T10:30:00Z"), drainedAt(ts("2026-01-05T11:00:00Z")))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertWindows(t, []migration.Window{w}, windows("2026-01-04T10:20:00Z", "2026-01-05T11:00:00Z"))
+}
+
+func TestFirstSyncWithAnEmptyRangeRecordsNoBackfillStart(t *testing.T) {
+	st := &state.Memory{}
+	s := newSyncer(&fakeCopier{}, st, ts("2026-01-03T06:00:00Z"))
+
+	if err := s.Sync(t.Context(), ts("2026-01-03T00:00:00Z"), ts("2026-01-02T00:00:00Z")); err == nil {
+		t.Fatal("want an error for --since after --until")
+	}
+
+	if got, _ := st.Load(t.Context()); !got.BackfillStart.IsZero() {
+		t.Errorf("BackfillStart = %v; a corrected --since would be ignored on the next run", got.BackfillStart)
+	}
+}

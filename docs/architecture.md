@@ -19,17 +19,22 @@ the tool works and why it is built this way.
 - **The tool doesn't change Kubernetes objects.** In most setups a GitOps repository owns the VMCluster, VMAgent and
   Service objects. The tool says when each change is due and checks that it took effect. An `--apply` mode for
   setups without GitOps is on the [roadmap](roadmap.md).
-- **vmctl as the copy engine.** Each chunk is one `vmctl vm-native` run: a `GET /api/v1/export/native` on blue's
-  vmselect, streamed into `POST /api/v1/import/native` on green's vminsert. vmctl is proven, splits the work per
-  metric name and retries requests. A copy engine written in Go (about a hundred lines) would remove the vmctl
-  binary and allow checkpoints per metric name, and could change the rate within a chunk. It sits behind the same
+- **vmctl as the copy engine.** Each chunk is one `vmctl vm-native` run: `GET /api/v1/export/native` on blue's
+  vmselect, streamed into `POST /api/v1/import/native` on green's vminsert, one request per hour of the chunk,
+  spread over `--concurrency` workers. The tool turns off vmctl's per-metric mode: that mode first lists metric names
+  through `/api/v1/label/__name__/values`, which vmselect may answer partially when a vmstorage node is down, and
+  vmctl would then skip the missing names and still succeed. A native export fails instead of returning partial
+  data. vmctl doesn't retry requests in this mode, so the tool retries the whole chunk. vmctl applies its rate limit
+  per request, so the tool divides `--rate-limit` by the number of requests that run at once. A copy engine written
+  in Go would remove the vmctl binary and could change the rate within a chunk. It sits behind the same
   `migration.Copier` interface, so it can replace vmctl without other changes, if chunks turn out too coarse or too
   slow.
 - **Same version on blue and green.** The native format is version-coupled, so `preflight` compares the image tags
   of all running components.
 - **Dual write plus a final sync, with deduplication.** Dual write keeps green current without a gap, and the final
-  sync covers writers that bypass VMAgent. The windows overlap on purpose (`[last sync - 1h, blue drained]`).
-  That is safe only because green runs with `-dedup.minScrapeInterval=1ms`, which `preflight` checks.
+  sync covers writers that bypass VMAgent. The windows overlap on purpose (`[last sync - --final-overlap, blue
+  drained]`, 1h by default). That is safe only because green runs with `-dedup.minScrapeInterval=1ms`, which
+  `preflight` checks.
 - **Time-ordered chunks with a high-water mark.** Chunks run oldest first and one at a time, so the state needs only
   the end of the last finished chunk to resume. Backfill and catch-up are the same operation: copy from the
   high-water mark to now.
@@ -149,7 +154,7 @@ sequenceDiagram
         G->>B: GET /metrics on every pod
         B-->>G: query slots in use, waits, p99 latency
         G-->>S: rate limit (halved if busy, +10% of max if not)
-        S->>V: vm-native, time filter = chunk, --vm-rate-limit = rate / workers
+        S->>V: vm-native, one request per hour of the chunk, --vm-rate-limit = rate / parallel requests
         V->>B: GET /api/v1/export/native
         B-->>V: native blocks
         V->>GI: POST /api/v1/import/native
@@ -169,9 +174,10 @@ Chunk boundaries are aligned to `--step`, so a day step cuts at UTC midnight.
 
 The final sync refuses a cutover time in the future. It checks that blue is drained before it copies, and copies
 up to the moment the check passed, so samples from a writer that stopped late are not left on blue. If a catch-up
-already ran past the cutover, its window starts at `Tcut - 1h` instead of `SyncedUntil - 1h`, so the time around the
-cutover is always copied and verified. A rerun with the same cutover keeps the first run's window start, so a day
-that failed to verify is copied and verified again. Run it in a Job that doesn't restart on failure
+already ran past the cutover, its window starts at `Tcut - 1h` instead of `SyncedUntil - 1h` (1h is the default of
+`--final-overlap`, which must cover the oldest timestamps that writers bypassing dual write still send), so the time
+around the cutover is always copied and verified. A rerun with the same cutover keeps the first run's window start,
+so a day that failed to verify is copied and verified again. Run it in a Job that doesn't restart on failure
 ([deploy/job-final.yaml](../deploy/job-final.yaml)): a failed drain check or verify needs a person to look, not a
 blind rerun.
 
@@ -181,7 +187,7 @@ flowchart TD
     wait --> drain{"does blue's vminsert accept<br/>no rows for one --drain-interval<br/>within --drain-timeout?"}
     drain -- "no" --> fail(["FAIL: nothing copied,<br/>a writer still points at blue"])
     drain -- "unknown: pods restarted<br/>in every interval" --> unknown(["FAIL: nothing copied,<br/>rerun once pods are stable"])
-    drain -- "yes, at Tdrained" --> copy["copy [min(SyncedUntil, Tcut) - 1h, Tdrained]<br/>(overlap is safe: green deduplicates)"]
+    drain -- "yes, at Tdrained" --> copy["copy [min(SyncedUntil, Tcut) - overlap, Tdrained]<br/>(overlap is safe: green deduplicates)"]
     copy --> reset["reset the rollup result cache<br/>on every green vmselect pod"]
     reset --> verify["verify the days the final sync copied<br/>(partial responses fail)"]
     verify --> ok(["Done: keep blue for rollback, then delete it"])

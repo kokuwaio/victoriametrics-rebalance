@@ -51,6 +51,9 @@ type Syncer struct {
 	Retries int
 	// Backoff is the wait before the first retry. It doubles with every further retry.
 	Backoff time.Duration
+	// FinalOverlap is how far before the last synced point the final sync starts. It must cover the oldest
+	// timestamps that writers bypassing dual write still send. Default: DefaultFinalOverlap.
+	FinalOverlap time.Duration
 	// Pacer sets each chunk's rate limit. Default: no limit.
 	Pacer Pacer
 	// Metrics records the progress. May be nil.
@@ -75,6 +78,10 @@ func (s *Syncer) Sync(ctx context.Context, start, until time.Time) error {
 	switch {
 	case !st.SyncedUntil.IsZero():
 		start = st.SyncedUntil
+	case st.BackfillStart.IsZero() && !start.Before(until):
+		// Recording this start would make it stick for later runs, although nothing was copied.
+		return fmt.Errorf("nothing to copy: start %s is not before %s", start.UTC().Format(time.RFC3339),
+			until.UTC().Format(time.RFC3339))
 	default:
 		// Record the backfill start once; a first run that stopped before finishing a chunk resumes from it.
 		updated, err := s.Store.Update(ctx, func(st *state.State) {
@@ -102,9 +109,9 @@ func (s *Syncer) validate() error {
 }
 
 const (
-	// FinalOverlap is how far before the last synced point the final sync starts, to pick up samples that arrived
-	// late on blue. Overlaps are safe because green deduplicates samples with equal timestamps.
-	FinalOverlap = time.Hour
+	// DefaultFinalOverlap is how far before the last synced point the final sync starts by default, to pick up
+	// samples that arrived late on blue. Overlaps are safe because green deduplicates samples with equal timestamps.
+	DefaultFinalOverlap = time.Hour
 	// FinalTail is how long after the cutover the final sync waits before it checks that blue is drained, so
 	// writers that switched late have stopped.
 	FinalTail = 15 * time.Minute
@@ -112,7 +119,8 @@ const (
 
 // Final runs the last sync after cutover. It waits until cutover + FinalTail, then calls drained, which returns
 // once blue receives no more writes and when that was. Only then does it copy
-// [SyncedUntil - FinalOverlap, max(cutover + FinalTail, drained)], so every sample blue received is copied. When a
+// [SyncedUntil - FinalOverlap, max(cutover + FinalTail, drained)], so every sample blue received is copied, as long
+// as no writer that bypasses dual write sends samples older than FinalOverlap. When a
 // catch-up already ran past the cutover, the window starts at cutover - FinalOverlap instead, so the time around
 // the cutover is copied and verified either way. A rerun for the same cutover keeps the start of the first run's
 // window, so days that failed to verify are copied and verified again. If drained fails, Final copies nothing and
@@ -136,7 +144,11 @@ func (s *Syncer) Final(ctx context.Context, cutover time.Time, drained func(cont
 	if cutover.Before(from) {
 		from = cutover
 	}
-	w := Window{Start: from.Add(-FinalOverlap), End: cutover.Add(FinalTail)}
+	overlap := s.FinalOverlap
+	if overlap <= 0 {
+		overlap = DefaultFinalOverlap
+	}
+	w := Window{Start: from.Add(-overlap), End: cutover.Add(FinalTail)}
 	if st.CutoverAt.Equal(cutover) && !st.FinalStart.IsZero() && st.FinalStart.Before(w.Start) {
 		w.Start = st.FinalStart
 	}

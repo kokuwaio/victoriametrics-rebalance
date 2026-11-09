@@ -26,12 +26,13 @@ type VerifyOptions struct {
 	Rand *rand.Rand
 }
 
-// VerifyDay compares the day that starts at day (UTC midnight) between blue and green, up to end (at most
-// day + 24h). Green passes when it has as many samples for every sampled metric name up to end and, on a full
-// day, at least as many series as blue, minus the tolerance. Green may have more: it keeps receiving writes after
-// cutover.
-func VerifyDay(ctx context.Context, blue, green cluster.Client, day, end time.Time, o VerifyOptions) state.DayResult {
-	r := state.DayResult{Pass: true, CheckedAt: time.Now()}
+// VerifyDay compares [start, end) between blue and green; both must lie within one UTC day (end at most the next
+// midnight). Green passes when it has as many samples for every sampled metric name in that range and, when the
+// range is the full day, at least as many series as blue, minus the tolerance. Green may have more: it keeps
+// receiving writes after cutover.
+func VerifyDay(ctx context.Context, blue, green cluster.Client, start, end time.Time, o VerifyOptions) state.DayResult {
+	day := dayOf(start)
+	r := state.DayResult{Pass: true, CheckedAt: time.Now(), Partial: !IsFullDay(start, end)}
 	problem := func(format string, args ...any) {
 		r.Pass = false
 		r.Problems = append(r.Problems, fmt.Sprintf(format, args...))
@@ -48,14 +49,13 @@ func VerifyDay(ctx context.Context, blue, green cluster.Client, day, end time.Ti
 		return r
 	}
 	r.BlueSeries, r.GreenSeries = bs.TotalSeries, gs.TotalSeries
-	// The series count covers the whole day. On a partial day, blue can have series that writers outside dual write
-	// created after end, which green can't have yet, so only the sample counts up to end are compared.
-	fullDay := !end.Before(day.Add(24 * time.Hour))
-	if fullDay && fallsShort(float64(bs.TotalSeries), float64(gs.TotalSeries), o.Tolerance) {
+	// The series count covers the whole day. On a partial day, blue can have series outside [start, end) that were
+	// never copied (before start) or not yet (after end), so only the sample counts in the range are compared.
+	if !r.Partial && fallsShort(float64(bs.TotalSeries), float64(gs.TotalSeries), o.Tolerance) {
 		problem("series: blue %d, green %d", bs.TotalSeries, gs.TotalSeries)
 	}
 
-	window := end.Sub(day).Truncate(time.Second)
+	window := end.Sub(start).Truncate(time.Second)
 	for _, name := range sampleNames(bs.SeriesCountByMetricName, o) {
 		q := fmt.Sprintf("sum(count_over_time(%s[%ds]))", vm.MetricSelector(name), int64(window.Seconds()))
 		bc, err := vm.QuerySum(ctx, blue.SelectGet, q, end)
@@ -74,6 +74,15 @@ func VerifyDay(ctx context.Context, blue, green cluster.Client, day, end time.Ti
 	}
 	return r
 }
+
+// IsFullDay reports whether [start, end) covers a whole UTC day.
+func IsFullDay(start, end time.Time) bool {
+	day := dayOf(start)
+	return start.Equal(day) && !end.Before(day.Add(24*time.Hour))
+}
+
+// dayOf returns the UTC midnight that starts the day of t.
+func dayOf(t time.Time) time.Time { return t.UTC().Truncate(24 * time.Hour) }
 
 // fallsShort reports whether green has less than blue, minus the tolerance.
 func fallsShort(blue, green, tolerance float64) bool {
