@@ -176,3 +176,15 @@ func TestVerifyDayFailures(t *testing.T) {
 		})
 	}
 }
+
+func TestVerifyDayPartialDaySkipsTheWholeDaySeriesCount(t *testing.T) {
+	// Writers that bypass VMAgent created series on blue after the last synced point, which green can't have yet.
+	b, g := newSelect(1000, allCounts), newSelect(900, allCounts)
+	blue, green := clustersWith(b, g)
+
+	r := check.VerifyDay(t.Context(), blue, green, day, day.Add(6*time.Hour), withRand())
+
+	if !r.Pass {
+		t.Errorf("want pass on a partial day with equal samples, got %v", r.Problems)
+	}
+}

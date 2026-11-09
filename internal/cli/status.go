@@ -57,14 +57,16 @@ func printStatus(w io.Writer, st *state.State, now time.Time) {
 			secs += c.Seconds
 			covered += c.End.Sub(c.Start).Seconds()
 		}
-		row("Chunks", "%d recorded, %s copied in %s", n, formatBytes(bytes), durationOf(secs))
+		row("Chunks", "%d recorded, %s copied in %s", n, check.FormatBytes(float64(bytes)), durationOf(secs))
 		if secs > 0 && bytes > 0 {
-			row("Throughput", "%s/s", formatBytes(int64(float64(bytes)/secs)))
+			row("Throughput", "%s/s", check.FormatBytes(float64(bytes)/secs))
 		}
-		// Each second of copy work has covered covered/secs seconds of data so far.
 		if secs > 0 && st.FinalSyncAt.IsZero() {
-			behind := now.Sub(st.SyncedUntil).Seconds()
-			row("Catch-up ETA", "~%s at the recorded pace", durationOf(behind*secs/covered))
+			if eta, ok := catchUpETA(now.Sub(st.SyncedUntil).Seconds(), secs, covered); ok {
+				row("Catch-up ETA", "~%s at the recorded pace", eta)
+			} else {
+				row("Catch-up ETA", "not within a year at the recorded pace: the copy is barely faster than real time, or slower")
+			}
 		}
 	}
 
@@ -92,9 +94,23 @@ func printStatus(w io.Writer, st *state.State, now time.Time) {
 	}
 }
 
+// catchUpETA is how long the copy needs to reach "now" when it is behind seconds behind and has so far copied
+// covered seconds of data in copySeconds. "Now" keeps moving while it copies, so it gains (pace - 1) seconds per
+// second. ok is false when it won't catch up within a year: at a pace of 1 or less it never does.
+func catchUpETA(behind, copySeconds, covered float64) (eta time.Duration, ok bool) {
+	const maxSeconds = 365 * 24 * 3600
+	pace := covered / copySeconds
+	if pace <= 1 {
+		return 0, false
+	}
+	seconds := behind / (pace - 1)
+	if seconds > maxSeconds {
+		return 0, false
+	}
+	return durationOf(seconds), true
+}
+
 // durationOf converts seconds into a duration rounded to 100ms.
 func durationOf(seconds float64) time.Duration {
 	return time.Duration(seconds * float64(time.Second)).Round(100 * time.Millisecond)
 }
-
-func formatBytes(n int64) string { return check.FormatBytes(float64(n)) }

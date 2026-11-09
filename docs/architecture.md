@@ -167,10 +167,15 @@ Chunk boundaries are aligned to `--step`, so a day step cuts at UTC midnight.
 
 ## The final sync
 
+The final sync refuses a cutover time in the future. If a catch-up already ran past the cutover, its window starts
+at `Tcut - 1h` instead of `SyncedUntil - 1h`, so the time around the cutover is always copied and verified. Run it
+in a Job that doesn't restart on failure ([deploy/job-final.yaml](../deploy/job-final.yaml)): a failed drain check
+or verify needs a person to look, not a rerun.
+
 ```mermaid
 flowchart TD
     start(["sync --final --cutover-at Tcut"]) --> wait["wait until Tcut + 15m"]
-    wait --> copy["copy [SyncedUntil - 1h, Tcut + 15m]<br/>(overlap is safe: green deduplicates)"]
+    wait --> copy["copy [min(SyncedUntil, Tcut) - 1h, Tcut + 15m]<br/>(overlap is safe: green deduplicates)"]
     copy --> reset["reset the rollup result cache<br/>on every green vmselect pod"]
     reset --> drain{"does blue's vminsert accept<br/>no rows for one --drain-interval<br/>within --drain-timeout?"}
     drain -- "no" --> fail(["FAIL: a writer still points at blue"])
@@ -204,8 +209,8 @@ the `/metrics` of all of blue's vmselect pods:
 
 - **Busy:** queries waited for a free slot (`vm_concurrent_select_limit_reached_total` went up), more than
   `--max-select-utilization` of the query slots are in use (`vm_concurrent_select_current / _capacity`), or the
-  p99 latency of instant or range queries is above `--max-query-latency`. The governor halves the rate, but never
-  below `--min-rate-limit`.
+  p99 latency of instant or range queries is above `--max-query-latency` (only when that flag is set; latency is
+  ignored by default). The governor halves the rate, but never below `--min-rate-limit`.
 - **Not busy:** the governor raises the rate by a tenth of `--rate-limit`, up to `--rate-limit`.
 - **Can't be read:** it keeps the current rate and logs a warning.
 
@@ -215,14 +220,18 @@ limit" to vmctl.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Max: first chunk
-    Max --> Lower: blue busy
-    Lower --> Lower: blue busy (halve, floor at min)
-    Lower --> Raise: blue not busy
-    Raise --> Raise: blue not busy (+10% of max)
-    Raise --> Lower: blue busy
-    Raise --> Max: reached max
+    state "at --rate-limit" as AtMax
+    state "below --rate-limit" as Below
+    [*] --> AtMax: first reading, not busy
+    [*] --> Below: first reading, busy (halve)
+    AtMax --> AtMax: not busy
+    AtMax --> Below: busy (halve)
+    Below --> Below: busy (halve, floor at --min-rate-limit)
+    Below --> Below: not busy (+10% of --rate-limit)
+    Below --> AtMax: not busy, reached --rate-limit
 ```
+
+The governor reads blue's load before every chunk, the first one included.
 
 vmctl reads its rate limit once at startup, so the rate changes only between chunks. With `--adaptive`, use a
 small `--step` such as `1h`. The latency signal comes from vmselect's 5-minute summary window, so it reacts with

@@ -3,6 +3,7 @@ package migration_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -292,5 +293,75 @@ func TestSyncMetricsShowTheRun(t *testing.T) {
 		if !strings.Contains(out.String(), line+"\n") {
 			t.Errorf("metrics lack %q:\n%s", line, out.String())
 		}
+	}
+}
+
+func TestSyncAfterACrashBeforeTheFirstChunkStartsAtTheRecordedBackfillStart(t *testing.T) {
+	st := &state.Memory{}
+	_, _ = st.Update(t.Context(), func(s *state.State) { s.BackfillStart = ts("2026-01-01T10:00:00Z") })
+	c := &fakeCopier{}
+	s := newSyncer(c, st, ts("2026-01-03T06:00:00Z"))
+
+	// now - retention has moved on since the first run.
+	if err := s.Sync(t.Context(), ts("2026-01-01T16:00:00Z"), ts("2026-01-02T00:00:00Z")); err != nil {
+		t.Fatal(err)
+	}
+
+	assertWindows(t, c.calls, windows("2026-01-01T10:00:00Z", "2026-01-02T00:00:00Z"))
+}
+
+func TestSyncReturnsTheCancellationNotVMCtlsError(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	w := migration.Window{Start: ts("2026-01-01T00:00:00Z"), End: ts("2026-01-02T00:00:00Z")}
+	c := &cancellingCopier{cancel: cancel}
+	s := newSyncer(c, &state.Memory{}, ts("2026-01-03T06:00:00Z"))
+
+	err := s.Sync(ctx, w.Start, w.End)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
+	}
+}
+
+// cancellingCopier cancels the context and fails like a killed vmctl.
+type cancellingCopier struct{ cancel context.CancelFunc }
+
+func (c *cancellingCopier) Copy(context.Context, migration.Window, int64) (migration.CopyStats, error) {
+	c.cancel()
+	return migration.CopyStats{}, errors.New("vmctl: signal: killed")
+}
+
+func TestFinalRejectsACutoverInTheFuture(t *testing.T) {
+	st := &state.Memory{}
+	_, _ = st.Update(t.Context(), func(s *state.State) { s.SyncedUntil = ts("2026-01-05T10:20:00Z") })
+	c := &fakeCopier{}
+	s := newSyncer(c, st, ts("2026-01-05T11:00:00Z"))
+
+	if _, err := s.Final(t.Context(), ts("2026-01-15T10:30:00Z")); err == nil {
+		t.Fatal("want an error for a cutover in the future instead of sleeping for days")
+	}
+	if len(c.calls) != 0 {
+		t.Errorf("copied %v", c.calls)
+	}
+}
+
+func TestFinalAfterACatchUpPastTheCutoverStillCopiesAroundTheCutover(t *testing.T) {
+	st := &state.Memory{}
+	// A catch-up ran long after the cutover.
+	_, _ = st.Update(t.Context(), func(s *state.State) { s.SyncedUntil = ts("2026-01-05T14:00:00Z") })
+	c := &fakeCopier{}
+	s := newSyncer(c, st, ts("2026-01-05T15:00:00Z"))
+
+	w, err := s.Final(t.Context(), ts("2026-01-05T10:30:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := windows("2026-01-05T09:30:00Z", "2026-01-05T10:45:00Z")
+	assertWindows(t, []migration.Window{w}, want)
+	assertWindows(t, c.calls, want)
+	got, _ := st.Load(t.Context())
+	if !got.SyncedUntil.Equal(ts("2026-01-05T14:00:00Z")) {
+		t.Errorf("SyncedUntil moved back to %v", got.SyncedUntil)
 	}
 }

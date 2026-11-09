@@ -36,7 +36,7 @@ func (m *Metrics) chunkDone(c CopyStats, seconds float64, syncedUntil float64) {
 		return
 	}
 	m.chunks.Inc()
-	m.bytes.Add(int(c.Bytes))
+	m.bytes.AddInt64(c.Bytes)
 	m.duration.Update(seconds)
 	m.syncedUntil.Set(syncedUntil)
 }

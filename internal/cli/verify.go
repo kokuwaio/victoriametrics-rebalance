@@ -37,7 +37,9 @@ func newVerify(g *globalOptions) *cobra.Command {
 index, and the number of samples for the top N metric names plus a random set. It only reads from the clusters and
 can run at any time, also during a sync. Results are stored in the state.
 
-By default it checks the full days from the first sync's start up to the last synced point.`,
+By default it checks every day from the first full day after the backfill start up to the last synced point. The
+last day is usually partial: there only the sample counts up to the last synced point are compared, because the
+day's series count also includes series written afterwards.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			e, err := g.setup(cmd, true)
 			if err != nil {
@@ -113,8 +115,11 @@ func verifyDays(ctx context.Context, e *env, v verifyFlags, from, to time.Time) 
 			return nil, err
 		}
 		days, dayResults = append(days, d), append(dayResults, r)
-		res := check.Result{Name: "verify " + state.DayKey(d), Level: check.Pass,
-			Message: fmt.Sprintf("series: blue %d, green %d", r.BlueSeries, r.GreenSeries)}
+		msg := fmt.Sprintf("series: blue %d, green %d", r.BlueSeries, r.GreenSeries)
+		if end.Before(d.Add(day)) {
+			msg = fmt.Sprintf("samples up to %s match (partial day, series not compared)", end.UTC().Format(time.TimeOnly))
+		}
+		res := check.Result{Name: "verify " + state.DayKey(d), Level: check.Pass, Message: msg}
 		if !r.Pass {
 			res.Level, res.Message = check.Fail, strings.Join(r.Problems, "; ")
 		}

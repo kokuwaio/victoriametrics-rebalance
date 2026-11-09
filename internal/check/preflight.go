@@ -41,26 +41,26 @@ type PreflightOptions struct {
 // Preflight checks that green is ready to receive blue's data.
 func Preflight(ctx context.Context, blue, green cluster.Client, o PreflightOptions) Report {
 	var r Report
-	b, g := blue.Info(), green.Info()
+	blueInfo, greenInfo := blue.Info(), green.Info()
 
-	operational(&r, b, g)
-	if g.StorageReplicas > b.StorageReplicas {
-		r.add(StorageNodes, Pass, "blue has %d vmstorage nodes, green %d", b.StorageReplicas, g.StorageReplicas)
+	operational(&r, blueInfo, greenInfo)
+	if greenInfo.StorageReplicas > blueInfo.StorageReplicas {
+		r.add(StorageNodes, Pass, "blue has %d vmstorage nodes, green %d", blueInfo.StorageReplicas, greenInfo.StorageReplicas)
 	} else {
-		r.add(StorageNodes, Warn, "green has %d vmstorage nodes, blue %d: nothing to rebalance", g.StorageReplicas, b.StorageReplicas)
+		r.add(StorageNodes, Warn, "green has %d vmstorage nodes, blue %d: nothing to rebalance", greenInfo.StorageReplicas, blueInfo.StorageReplicas)
 	}
 	versions(ctx, &r, blue, green)
-	if b.Retention == g.Retention {
-		r.add(Retention, Pass, "both %q", b.Retention)
+	if blueInfo.Retention == greenInfo.Retention {
+		r.add(Retention, Pass, "both %q", blueInfo.Retention)
 	} else {
-		r.add(Retention, Fail, "blue %q, green %q", b.Retention, g.Retention)
+		r.add(Retention, Fail, "blue %q, green %q", blueInfo.Retention, greenInfo.Retention)
 	}
-	if b.ReplicationFactor == g.ReplicationFactor {
-		r.add(ReplicationFactor, Pass, "both %d", b.ReplicationFactor)
+	if blueInfo.ReplicationFactor == greenInfo.ReplicationFactor {
+		r.add(ReplicationFactor, Pass, "both %d", blueInfo.ReplicationFactor)
 	} else {
-		r.add(ReplicationFactor, Fail, "blue %d, green %d", b.ReplicationFactor, g.ReplicationFactor)
+		r.add(ReplicationFactor, Fail, "blue %d, green %d", blueInfo.ReplicationFactor, greenInfo.ReplicationFactor)
 	}
-	dedup(&r, g)
+	dedup(&r, greenInfo)
 	capacity(ctx, &r, blue, green, o.Headroom)
 	dualWrite(ctx, &r, blue, green, o)
 	podLabels(ctx, &r, blue, green)

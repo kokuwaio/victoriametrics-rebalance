@@ -62,25 +62,43 @@ type Syncer struct {
 }
 
 // Sync copies everything from where the last sync stopped up to until. On the first run (nothing synced yet) it
-// starts at start.
+// starts at start and records it as the backfill start; a first run that stopped before finishing a chunk is
+// resumed from that recorded start, so the backfill start always matches what was copied.
 func (s *Syncer) Sync(ctx context.Context, start, until time.Time) error {
-	if s.Step <= 0 {
-		return fmt.Errorf("step must be positive, got %s", s.Step)
+	if err := s.validate(); err != nil {
+		return err
 	}
 	st, err := s.Store.Load(ctx)
 	if err != nil {
 		return fmt.Errorf("load state: %w", err)
 	}
-	if !st.SyncedUntil.IsZero() {
+	switch {
+	case !st.SyncedUntil.IsZero():
 		start = st.SyncedUntil
-	} else if _, err := s.Store.Update(ctx, func(st *state.State) {
-		if st.BackfillStart.IsZero() {
-			st.BackfillStart = start
+	default:
+		// Record the backfill start once; a first run that stopped before finishing a chunk resumes from it.
+		updated, err := s.Store.Update(ctx, func(st *state.State) {
+			if st.BackfillStart.IsZero() {
+				st.BackfillStart = start
+			}
+		})
+		if err != nil {
+			return fmt.Errorf("save state: %w", err)
 		}
-	}); err != nil {
-		return fmt.Errorf("save state: %w", err)
+		if !updated.BackfillStart.Equal(start) {
+			s.log().Warn("resuming the first sync from the recorded backfill start, not the requested one",
+				"recorded", updated.BackfillStart, "requested", start)
+			start = updated.BackfillStart
+		}
 	}
 	return s.copyRange(ctx, Window{Start: start, End: until})
+}
+
+func (s *Syncer) validate() error {
+	if s.Step <= 0 {
+		return fmt.Errorf("step must be positive, got %s", s.Step)
+	}
+	return nil
 }
 
 const (
@@ -91,11 +109,17 @@ const (
 	FinalTail = 15 * time.Minute
 )
 
-// Final runs the last sync after cutover: [SyncedUntil - FinalOverlap, cutover + FinalTail]. It waits until the
-// end of that window has passed, records the cutover and the window in the state and returns the window.
+// Final runs the last sync after cutover: [SyncedUntil - FinalOverlap, cutover + FinalTail]. When a catch-up already
+// ran past the cutover, the window starts at cutover - FinalOverlap instead, so the time around the cutover is
+// copied and verified either way. It waits until the end of the window has passed, records the cutover and the
+// window in the state and returns the window.
 func (s *Syncer) Final(ctx context.Context, cutover time.Time) (Window, error) {
-	if s.Step <= 0 {
-		return Window{}, fmt.Errorf("step must be positive, got %s", s.Step)
+	if err := s.validate(); err != nil {
+		return Window{}, err
+	}
+	if cutover.After(s.Now()) {
+		return Window{}, fmt.Errorf("cutover %s is in the future: run the final sync after switching the aliases",
+			cutover.UTC().Format(time.RFC3339))
 	}
 	st, err := s.Store.Load(ctx)
 	if err != nil {
@@ -104,7 +128,11 @@ func (s *Syncer) Final(ctx context.Context, cutover time.Time) (Window, error) {
 	if st.SyncedUntil.IsZero() {
 		return Window{}, fmt.Errorf("nothing synced yet: run sync (backfill and catch-up) before the final sync")
 	}
-	w := Window{Start: st.SyncedUntil.Add(-FinalOverlap), End: cutover.Add(FinalTail)}
+	from := st.SyncedUntil
+	if cutover.Before(from) {
+		from = cutover
+	}
+	w := Window{Start: from.Add(-FinalOverlap), End: cutover.Add(FinalTail)}
 	if wait := w.End.Sub(s.Now()); wait > 0 {
 		s.log().Info("waiting for the end of the final window", "until", w.End, "wait", wait)
 		if err := s.Sleep(ctx, wait); err != nil {
@@ -157,7 +185,13 @@ func (s *Syncer) copyWithRetries(ctx context.Context, w Window, rate int64) (Cop
 	wait := s.Backoff
 	for attempt := 0; ; attempt++ {
 		stats, err := s.Copier.Copy(ctx, w, rate)
-		if err == nil || attempt >= s.Retries || ctx.Err() != nil {
+		if err == nil {
+			return stats, nil
+		}
+		if ctx.Err() != nil {
+			return CopyStats{}, ctx.Err()
+		}
+		if attempt >= s.Retries {
 			return stats, err
 		}
 		s.Metrics.retry()

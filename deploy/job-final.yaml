@@ -1,0 +1,47 @@
+# The final sync after cutover. Set --cutover-at to the time you switched the aliases to green.
+#
+# The run waits until 15 minutes after the cutover, copies the last window, resets green's rollup cache, waits up to
+# --drain-timeout for blue to stop receiving writes and verifies the copied days. It doesn't restart on failure:
+# a failed drain check or verify means a writer still points at blue or data is missing, which needs a person to
+# look, not a rerun. Fix the cause, then delete the Job and apply it again. If you set activeDeadlineSeconds, allow
+# for the 15 minute wait plus --drain-timeout (default 20m).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vmrebalance-final
+  namespace: monitoring
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vmrebalance
+    spec:
+      serviceAccountName: vmrebalance
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: vmrebalance
+          # No image is published yet: build one from the Dockerfile and push it to your registry.
+          image: vmrebalance:dev
+          args:
+            - sync
+            - --final
+            - --from=vmcluster
+            - --to=vmcluster-b
+            - --cutover-at=2026-01-02T10:00:00Z
+            - --rate-limit=50MiB/s
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]

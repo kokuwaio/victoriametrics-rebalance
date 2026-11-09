@@ -27,8 +27,9 @@ type VerifyOptions struct {
 }
 
 // VerifyDay compares the day that starts at day (UTC midnight) between blue and green, up to end (at most
-// day + 24h). Green passes when it has at least as many series, and as many samples for every sampled metric
-// name, as blue, minus the tolerance. Green may have more: it keeps receiving writes after cutover.
+// day + 24h). Green passes when it has as many samples for every sampled metric name up to end and, on a full
+// day, at least as many series as blue, minus the tolerance. Green may have more: it keeps receiving writes after
+// cutover.
 func VerifyDay(ctx context.Context, blue, green cluster.Client, day, end time.Time, o VerifyOptions) state.DayResult {
 	r := state.DayResult{Pass: true, CheckedAt: time.Now()}
 	problem := func(format string, args ...any) {
@@ -47,7 +48,10 @@ func VerifyDay(ctx context.Context, blue, green cluster.Client, day, end time.Ti
 		return r
 	}
 	r.BlueSeries, r.GreenSeries = bs.TotalSeries, gs.TotalSeries
-	if fallsShort(float64(bs.TotalSeries), float64(gs.TotalSeries), o.Tolerance) {
+	// The series count covers the whole day. On a partial day, blue can have series that writers outside dual write
+	// created after end, which green can't have yet, so only the sample counts up to end are compared.
+	fullDay := !end.Before(day.Add(24 * time.Hour))
+	if fullDay && fallsShort(float64(bs.TotalSeries), float64(gs.TotalSeries), o.Tolerance) {
 		problem("series: blue %d, green %d", bs.TotalSeries, gs.TotalSeries)
 	}
 

@@ -58,6 +58,9 @@ func (r *Report) add(name string, l Level, format string, args ...any) {
 	r.Results = append(r.Results, Result{Name: name, Level: l, Message: fmt.Sprintf(format, args...)})
 }
 
+// rowsInserted counts the rows a vminsert pod accepted.
+const rowsInserted = "vm_rows_inserted_total"
+
 // Sleeper waits for d or until ctx is done.
 type Sleeper func(ctx context.Context, d time.Duration) error
 
@@ -66,14 +69,14 @@ type Sleeper func(ctx context.Context, d time.Duration) error
 // restarted between the scrapes (counter went down) or appeared only in one scrape are skipped.
 func insertRate(ctx context.Context, c cluster.Client, window time.Duration, sleep Sleeper,
 	keep func(map[string]string) bool) (float64, error) {
-	before, err := insertCounters(ctx, c, keep)
+	before, err := scrape(ctx, c, cluster.Insert, rowsInserted, keep)
 	if err != nil {
 		return 0, err
 	}
 	if err := sleep(ctx, window); err != nil {
 		return 0, err
 	}
-	after, err := insertCounters(ctx, c, keep)
+	after, err := scrape(ctx, c, cluster.Insert, rowsInserted, keep)
 	if err != nil {
 		return 0, err
 	}
@@ -84,10 +87,6 @@ func insertRate(ctx context.Context, c cluster.Client, window time.Duration, sle
 		}
 	}
 	return rows / window.Seconds(), nil
-}
-
-func insertCounters(ctx context.Context, c cluster.Client, keep func(map[string]string) bool) (map[string]float64, error) {
-	return scrape(ctx, c, cluster.Insert, "vm_rows_inserted_total", keep)
 }
 
 // scrape reads /metrics from every running pod of a component and returns, per pod name, the sum of the samples

@@ -54,9 +54,9 @@ chunk is recorded in the state, so a restarted run continues where the last one 
 The first run starts at now - retention. Later runs continue from the last finished chunk up to --until. Repeat
 sync (catch-up) until one run takes only minutes, then switch the read and write aliases to green.
 
-sync --final runs after the cutover. It copies [last synced point - 1h, cutover + 15m], waiting until that time
-has passed, resets the rollup result cache on every green vmselect pod, checks that blue no longer receives
-writes, and verifies the days it copied.`,
+sync --final runs after the cutover. It copies [last synced point - 1h, cutover + 15m] (from cutover - 1h if a
+catch-up already ran past the cutover), waiting until that time has passed. Then it resets the rollup result cache
+on every green vmselect pod, checks that blue no longer receives writes, and verifies the days it copied.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runSync(cmd, g, o)
 		},
@@ -257,11 +257,11 @@ func runFinal(ctx context.Context, e *env, o *syncOptions, syncer *migration.Syn
 	}
 	results = append(results, check.WaitDrained(ctx, e.blue, o.drain))
 	days, err := verifyDays(ctx, e, o.verify, w.Start, w.End)
+	results = append(results, days...)
+	printReport(e.out, results)
 	if err != nil {
 		return err
 	}
-	results = append(results, days...)
-	printReport(e.out, results)
 	if check.AnyFailed(results) {
 		fmt.Fprintln(e.out, "\nDon't delete blue yet: fix the failed checks first. Rollback: switch the aliases back to blue.")
 		return errChecksFailed

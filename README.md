@@ -50,7 +50,7 @@ sync   [ backfill: now-retention ── now ][ catch-up ── Tc ]      [ final
 | 6. `verify` | tool | Compares blue and green per day. |
 | 7. `sync` | tool | Catch-up: copies from the last synced point to now. Repeat until a run takes only minutes. |
 | 8. Cutover | you | Point the read and write aliases at green. This is Tcut. |
-| 9. `sync --final` | tool | Copies `[last synced point - 1h, Tcut + 15m]`, resets green's rollup cache, checks that blue no longer receives writes, and verifies the copied days. |
+| 9. `sync --final` | tool | Copies `[last synced point - 1h, Tcut + 15m]` (from `Tcut - 1h` if a catch-up already ran past the cutover), resets green's rollup cache, checks that blue no longer receives writes, and verifies the copied days. |
 | 10. Soak and delete | you | Keep blue for a few days so you can roll back, then delete blue and its PVCs. |
 
 Why dual write *and* a final sync:
@@ -65,7 +65,9 @@ Why dual write *and* a final sync:
   functions.
 
 Rollback until step 10: switch the aliases back to blue. Blue still has everything up to the cutover. To copy data
-written to green after the cutover back to blue, run `sync` with `--from` and `--to` swapped.
+written to green after the cutover back to blue, swap `--from` and `--to` and start at the cutover:
+`vmrebalance sync --from vmcluster-b --to vmcluster --since <cutover>`. Without `--since`, the swapped run has a new
+state and would copy green's whole retention.
 
 ## Requirements
 
@@ -103,12 +105,14 @@ vmrebalance sync      --namespace monitoring --from vmcluster --to vmcluster-b -
 Run `vmrebalance <command> --help` for all flags. The most important ones:
 
 - `sync --until now|<RFC 3339>`: copy up to this time (default: now).
+- `sync --since <RFC 3339>`: on the first run, start here instead of at now - retention (used for a rollback).
 - `sync --step 24h`: the chunk size. Every finished chunk is recorded, so a restarted run continues with the first
   unfinished one.
 - `sync --rate-limit 50MiB/s --concurrency 2`: the export reads go through blue's vmselect and vmstorage and compete
   with real queries. Start low and watch blue's load.
-- `sync --adaptive`: halve the rate while blue's vmselect is busy (queries wait for a slot, most slots are in use,
-  or `--max-query-latency` is exceeded), and raise it again when it isn't. The rate changes between chunks, so
+- `sync --adaptive`: halve the rate while blue's vmselect is busy (queries wait for a slot, or most slots are in use),
+  and raise it again when it isn't. Latency counts only if you set `--max-query-latency`, e.g. `5s`; it is off by
+  default. The rate changes between chunks, so
   combine it with a small `--step`. See [docs/architecture.md](docs/architecture.md#adaptive-rate-limit).
 - `sync --metrics-addr :8080`: serve the tool's Prometheus metrics (progress, rate limit, blue's load).
 - `sync --final --cutover-at <time>`: the time you switched the aliases. The final window is measured from it.
@@ -125,7 +129,8 @@ Run `vmrebalance <command> --help` for all flags. The most important ones:
 
 `sync` runs [vmctl](https://docs.victoriametrics.com/victoriametrics/vmctl/) once per chunk. vmctl needs network
 access to blue's vmselect and green's vminsert, so run `sync` as a Job in the cluster:
-[deploy/rbac.yaml](deploy/rbac.yaml) holds the permissions, [deploy/job.yaml](deploy/job.yaml) is an example Job.
+[deploy/rbac.yaml](deploy/rbac.yaml) holds the permissions, [deploy/job.yaml](deploy/job.yaml) is an example sync
+Job and [deploy/job-final.yaml](deploy/job-final.yaml) one for the final sync.
 No image is published yet, so build one from the [Dockerfile](Dockerfile), which bundles vmctl.
 
 From a workstation, port-forward both Services and pass `--from-select-url http://localhost:8481` and
@@ -146,7 +151,8 @@ from a workstation without port-forwarding.
 - `verify` only reads from the clusters, so it can run at any time, also during a sync. Per UTC day it compares the
   series count from `/api/v1/status/tsdb` and `count_over_time` sample counts for the top N metric names plus a
   random set (counting every series is too expensive on large clusters). Green passes with at least as many series
-  and samples as blue, minus a tolerance (default 1%).
+  and samples as blue, minus a tolerance (default 1%). On the last, partial day only the sample counts are compared,
+  because the day's series count also includes series written after the last synced point.
 - `sync --final`: rollup cache reset on every green vmselect pod, so no pod serves results cached before the
   backfill; blue's vminsert receives no rows during one `--drain-interval` within `--drain-timeout`, otherwise some
   writer still points at blue; `verify` for the days the final sync copied.
