@@ -9,7 +9,8 @@ RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 ARG TARGETOS TARGETARCH
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/vmrebalance ./cmd/vmrebalance
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/vmrebalance ./cmd/vmrebalance
 
 FROM victoriametrics/vmctl:${VMCTL_VERSION} AS vmctl
 

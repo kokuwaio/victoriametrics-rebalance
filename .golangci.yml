@@ -1,0 +1,12 @@
+version: "2"
+run:
+  build-tags:
+    - e2e
+linters:
+  exclusions:
+    presets:
+      - std-error-handling # Close, Remove, ... on best-effort cleanup paths
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck

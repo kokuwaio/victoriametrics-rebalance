@@ -144,7 +144,7 @@ func runSync(cmd *cobra.Command, g *globalOptions, o *syncOptions) error {
 	if err != nil {
 		return err
 	}
-	start := now
+	var start time.Time
 	if o.since != "" {
 		if start, err = parseTime("--since", o.since, now); err != nil {
 			return err
