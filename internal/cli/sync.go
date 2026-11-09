@@ -101,6 +101,9 @@ func runSync(cmd *cobra.Command, g *globalOptions, o *syncOptions) error {
 	if o.final && (o.cutoverAt == "" || o.drain.Interval <= 0 || o.drain.Timeout <= 0) {
 		return errors.New("--final needs --cutover-at, and positive --drain-interval and --drain-timeout")
 	}
+	if o.final && o.drain.Interval < time.Minute {
+		return errors.New("--drain-interval must be at least 1m: a send to a hung vmstorage node takes up to a minute to fail")
+	}
 	if o.final {
 		if err := o.verify.validate(); err != nil {
 			return err

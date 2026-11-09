@@ -122,6 +122,22 @@ func (f *fakeCluster) setPending(pending []int) {
 	}
 }
 
+// addRPC appends vminsert RPC metrics to the n-th scrape of every vminsert pod: rows sent to vmstorage, failed
+// sends, and whether the vmstorage node is reachable.
+func (f *fakeCluster) addRPC(n, sent, sendErrors int, reachable bool) {
+	r := 0
+	if reachable {
+		r = 1
+	}
+	for _, p := range f.pods[cluster.Insert] {
+		f.podResp[p.Name+"/metrics"][n] += fmt.Sprintf(
+			"vm_rpc_rows_sent_total{name=\"vminsert\",addr=\"vmstorage-0:8400\"} %d\n"+
+				"vm_rpc_connection_errors_total{name=\"vminsert\",addr=\"vmstorage-0:8400\"} %d\n"+
+				"vm_rpc_vmstorage_is_reachable{name=\"vminsert\",addr=\"vmstorage-0:8400\"} %d\n",
+			sent, sendErrors, r)
+	}
+}
+
 // setInsertedWithStarts is setInserted with a vm_app_start_timestamp per scrape.
 func (f *fakeCluster) setInsertedWithStarts(live, native, started []int) {
 	for _, p := range f.pods[cluster.Insert] {

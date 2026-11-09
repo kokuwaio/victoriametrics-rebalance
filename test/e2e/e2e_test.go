@@ -99,7 +99,7 @@ func TestMigration(t *testing.T) {
 		// A cutover 15 minutes ago lets the final sync start right away.
 		cutover := time.Now().Add(-15 * time.Minute).UTC().Format(time.RFC3339)
 		e.runJob("vmrebalance-final", "sync", "--final", "--from=blue", "--to=green", "--cutover-at="+cutover,
-			"--drain-interval=20s", "--drain-timeout=5m", "--top-n=5", "--random-n=5")
+			"--drain-interval=1m", "--drain-timeout=5m", "--top-n=5", "--random-n=5")
 	})
 
 	t.Run("status", func(t *testing.T) {

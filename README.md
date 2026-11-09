@@ -123,7 +123,8 @@ Run `vmrebalance <command> --help` for all flags. The most important ones:
 - `sync --final --cutover-at <time>`: the time you switched the aliases. The final window is measured from it.
   `--final-overlap` (default 1h) is how far before the last synced point the final window starts.
   `--drain-interval` (default 5m) must be longer than the push interval of your slowest writer: blue passes only
-  when it receives no rows at all during one whole interval.
+  when it receives no rows at all during one whole interval. It must also be at least 1m, because a send from
+  vminsert to a hung vmstorage node takes up to a minute to fail.
 - `--state-file state.json`: keep the state in a local file instead of the ConfigMap `vmrebalance.<from>.<to>`
   (`vmrebalance.<from>.<to>.tenant-<tenant>` for tenants other than 0; each tenant has its own state).
   This is fine on a workstation. A Job needs the ConfigMap, because its pod loses local files when it restarts.
@@ -164,11 +165,13 @@ from a workstation without port-forwarding.
   and samples as blue, minus a tolerance (default 1%). On a partial first or last day only the sample counts within
   the range are compared, because the day's series count also includes series outside it.
 - `sync --final`: before copying, blue's vminsert receives no rows during one `--drain-interval` within
-  `--drain-timeout` and holds no rows still queued for vmstorage, otherwise some writer still points at blue (a
-  window in which a vminsert pod restarted counts as unknown and is measured again). After copying, it waits 30
-  seconds until green has made the rows searchable, then resets the rollup cache on every green vmselect pod, so no
-  pod serves results cached before the backfill, and runs `verify` for the days the final sync copied, failing on
-  partial responses. It also fails while any day stored in the state failed verify and hasn't passed since.
+  `--drain-timeout`, and has delivered every row it accepted (nothing buffered for vmstorage, no rows sent and no
+  failed sends during the window, every vmstorage node reachable); otherwise some writer still points at blue or rows are
+  still on their way (a window in which a vminsert pod restarted counts as unknown and is measured again). After
+  copying, it waits 30 seconds until green has made the rows searchable, then resets the rollup cache on every green
+  vmselect pod, so no pod serves results cached before the backfill, and runs `verify` for the days the final sync
+  copied, failing on partial responses. It also fails while any day stored in the state failed verify and hasn't
+  passed since.
 
 ## Risks
 

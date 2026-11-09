@@ -136,7 +136,52 @@ func TestDrainFailsWhileRowsStayQueuedForVMStorage(t *testing.T) {
 
 	res := check.WaitDrained(t.Context(), blue, drainOpts)
 
-	if res.Level != check.Fail || !strings.Contains(res.Message, "500 rows for vmstorage") {
+	if res.Level != check.Fail || !strings.Contains(res.Message, "still delivering") {
 		t.Errorf("drain = %s %q", res.Level, res.Message)
+	}
+}
+
+func TestDrainWaitsUntilInFlightRowsAreDelivered(t *testing.T) {
+	blue := newCluster("blue", 2)
+	// No new rows and nothing buffered, but 300 rows reach vmstorage during the first window: they were in flight.
+	blue.setInserted([]int{1000, 1000, 1000, 1000}, []int{0, 0, 0, 0})
+	for i, sent := range []int{700, 1000, 1000, 1000} {
+		blue.addRPC(i, sent, 0, true)
+	}
+
+	res := check.WaitDrained(t.Context(), blue, drainOpts)
+
+	if res.Level != check.Pass || len(blue.podGets) != 4 {
+		t.Errorf("drain = %s %q after %d scrapes, want a pass in the second window", res.Level, res.Message, len(blue.podGets))
+	}
+}
+
+func TestDrainFailsWhileAVMStorageNodeIsUnreachable(t *testing.T) {
+	blue := newCluster("blue", 2)
+	// The vminsert pod keeps retrying a batch: nothing is buffered or sent, but the node is unreachable.
+	blue.setInserted([]int{1000, 1000, 1000, 1000, 1000, 1000}, []int{0, 0, 0, 0, 0, 0})
+	for i := range 6 {
+		blue.addRPC(i, 700, 0, false)
+	}
+
+	res := check.WaitDrained(t.Context(), blue, drainOpts)
+
+	if res.Level != check.Fail || !strings.Contains(res.Message, "unreachable") {
+		t.Errorf("drain = %s %q, want a failure naming the unreachable vmstorage node", res.Level, res.Message)
+	}
+}
+
+func TestDrainFailsWhileSendsToAHungVMStorageNodeKeepFailing(t *testing.T) {
+	blue := newCluster("blue", 2)
+	// The node accepts connections but never answers: it looks reachable at every scrape, but sends keep failing.
+	blue.setInserted([]int{1000, 1000, 1000, 1000, 1000, 1000}, []int{0, 0, 0, 0, 0, 0})
+	for i := range 6 {
+		blue.addRPC(i, 700, i, true)
+	}
+
+	res := check.WaitDrained(t.Context(), blue, drainOpts)
+
+	if res.Level != check.Fail || !strings.Contains(res.Message, "fail to send") {
+		t.Errorf("drain = %s %q, want a failure about failed sends", res.Level, res.Message)
 	}
 }

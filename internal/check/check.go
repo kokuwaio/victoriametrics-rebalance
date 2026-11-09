@@ -65,14 +65,18 @@ const rowsInserted = "vm_rows_inserted_total"
 type Sleeper func(ctx context.Context, d time.Duration) error
 
 // insertRate measures the rows per second a cluster's vminsert pods accept, from two scrapes of
-// vm_rows_inserted_total window apart. keep filters the counters by their labels (nil keeps all).
+// vm_rows_inserted_total window apart. keep filters the counters by their labels (nil keeps all). It also reports
+// what the pods still have to deliver to vmstorage, see ingestion.
 //
 // Pods that restarted between the scrapes (another vm_app_start_timestamp, or the counter went down) or appeared or
 // vanished in between are left out of the rate, and complete is false: what those pods received is unknown, so a
 // rate of 0 doesn't prove there were no writes.
 func insertRate(ctx context.Context, c cluster.Client, window time.Duration, sleep Sleeper,
 	keep func(map[string]string) bool) (ingestion, error) {
-	type reading struct{ rows, started, pending float64 }
+	type reading struct {
+		rows, started, pending, sent, sendErrors float64
+		unreachable                              bool
+	}
 	read := func() (map[string]reading, error) {
 		samples, err := scrapeAll(ctx, c, cluster.Insert)
 		if err != nil {
@@ -81,9 +85,12 @@ func insertRate(ctx context.Context, c cluster.Client, window time.Duration, sle
 		out := map[string]reading{}
 		for pod, s := range samples {
 			out[pod] = reading{
-				rows:    vm.Sum(s, rowsInserted, keep),
-				started: vm.Sum(s, appStarted, nil),
-				pending: vm.Sum(s, rowsPending, nil),
+				rows:        vm.Sum(s, rowsInserted, keep),
+				started:     vm.Sum(s, appStarted, nil),
+				pending:     vm.Sum(s, rowsPending, nil),
+				sent:        vm.Sum(s, rowsSent, nil),
+				sendErrors:  vm.Sum(s, sendErrors, nil),
+				unreachable: storageUnreachable(s),
 			}
 		}
 		return out, nil
@@ -100,18 +107,21 @@ func insertRate(ctx context.Context, c cluster.Client, window time.Duration, sle
 		return ingestion{}, err
 	}
 	var rows float64
-	m := ingestion{complete: len(before) == len(after)}
+	in := ingestion{complete: len(before) == len(after)}
 	for pod, a := range after {
 		b, ok := before[pod]
-		m.pending += a.pending
+		in.pending += a.pending
+		in.storageUnreachable = in.storageUnreachable || a.unreachable || b.unreachable
 		if !ok || a.started != b.started || a.rows < b.rows {
-			m.complete = false
+			in.complete = false
 			continue
 		}
 		rows += a.rows - b.rows
+		in.delivered = in.delivered || a.sent != b.sent
+		in.sendFailed = in.sendFailed || a.sendErrors != b.sendErrors
 	}
-	m.rate = rows / window.Seconds()
-	return m, nil
+	in.rate = rows / window.Seconds()
+	return in, nil
 }
 
 // ingestion is what insertRate measured.
@@ -120,12 +130,42 @@ type ingestion struct {
 	rate float64
 	// complete is false when a pod restarted, appeared or vanished during the window.
 	complete bool
-	// pending is the rows the vminsert pods accepted but haven't sent to vmstorage yet, at the end of the window.
+	// pending is the rows the vminsert pods buffer for vmstorage at the end of the window.
 	pending float64
+	// delivered is true when the pods sent rows to vmstorage during the window: rows were still on their way.
+	delivered bool
+	// sendFailed is true when a send to vmstorage failed during the window. A batch whose delivery keeps failing
+	// isn't counted as pending; a node that accepts connections but never answers shows only as failed sends.
+	sendFailed bool
+	// storageUnreachable is true when a pod saw a vmstorage node as unreachable at either scrape. Read-only nodes
+	// don't count: vminsert sends their rows to the other nodes.
+	storageUnreachable bool
 }
 
-// rowsPending counts rows a vminsert pod buffers for a vmstorage node.
-const rowsPending = "vm_rpc_rows_pending"
+// done reports whether the window proves that the pods neither accepted nor still deliver any rows.
+func (in ingestion) done() bool {
+	return in.rate == 0 && in.complete && in.pending == 0 && !in.delivered && !in.sendFailed && !in.storageUnreachable
+}
+
+// storageUnreachable reports whether a vminsert pod's metrics show a vmstorage node it can't reach.
+func storageUnreachable(samples []vm.Sample) bool {
+	for _, s := range samples {
+		if s.Name == "vm_rpc_vmstorage_is_reachable" && s.Value == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+const (
+	// rowsPending counts rows a vminsert pod buffers for a vmstorage node. A batch the pod is sending right now
+	// isn't included.
+	rowsPending = "vm_rpc_rows_pending"
+	// rowsSent counts rows a vminsert pod delivered to vmstorage nodes.
+	rowsSent = "vm_rpc_rows_sent_total"
+	// sendErrors counts failed sends of a vminsert pod to vmstorage nodes.
+	sendErrors = "vm_rpc_connection_errors_total"
+)
 
 // appStarted is when a VictoriaMetrics process started (Unix seconds).
 const appStarted = "vm_app_start_timestamp"

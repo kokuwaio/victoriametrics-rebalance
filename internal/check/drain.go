@@ -27,30 +27,42 @@ type DrainOptions struct {
 // fails when blue still receives writes after Timeout. A writer that still points at blue writes data that is lost
 // once blue is deleted, so any row counts, not just a high rate. A writer that pushes less often than Interval can
 // slip through, so Interval must be longer than the slowest writer's push interval. A window in which a vminsert pod
-// restarted, appeared or vanished proves nothing and is measured again. Blue also isn't drained while its vminsert
-// pods still hold rows they accepted but haven't sent to vmstorage, which the final export couldn't read yet.
+// restarted, appeared or vanished proves nothing and is measured again.
+//
+// Blue also isn't drained while its vminsert pods still deliver rows they accepted, which the final export couldn't
+// read yet: rows buffered for vmstorage (pending), rows sent during the window (they were still on their way at its
+// start), and a batch whose delivery keeps failing, which shows as failed sends or an unreachable vmstorage node.
+// A single send gives up after about a minute, so Interval must be longer than that.
 func WaitDrained(ctx context.Context, blue cluster.Client, o DrainOptions) Result {
 	if o.Interval <= 0 {
 		return Result{Name: Drain, Level: Fail, Message: "drain interval must be positive"}
 	}
 	attempts := max(1, int(o.Timeout/o.Interval))
-	var lastWrites, pending float64 // the rate of the latest window that saw writes; the rows still queued
+	var lastWrites float64 // the rate of the latest window that saw writes
+	var last ingestion
 	for range attempts {
-		m, err := insertRate(ctx, blue, o.Interval, o.Sleep, nil)
+		var err error
+		last, err = insertRate(ctx, blue, o.Interval, o.Sleep, nil)
 		if err != nil {
 			return Result{Name: Drain, Level: Fail, Message: err.Error()}
 		}
-		pending = m.pending
-		if m.rate == 0 && m.complete && pending == 0 {
-			return Result{Name: Drain, Level: Pass, Message: "blue receives no more writes"}
+		if last.done() {
+			return Result{Name: Drain, Level: Pass, Message: "blue receives no more writes and has delivered every row"}
 		}
-		if m.rate > 0 {
-			lastWrites = m.rate
+		if last.rate > 0 {
+			lastWrites = last.rate
 		}
 	}
-	if lastWrites == 0 && pending > 0 {
+	switch {
+	case lastWrites > 0:
+		// Reported below.
+	case last.storageUnreachable || last.sendFailed:
 		return Result{Name: Drain, Level: Fail, Message: fmt.Sprintf(
-			"blue's vminsert pods still hold %.0f rows for vmstorage after %s: check blue's vmstorage nodes", pending,
+			"blue's vminsert pods still fail to send to a vmstorage node (unreachable, or not answering) after %s, so "+
+				"rows may still wait for delivery: fix blue's vmstorage nodes, then run the final sync again", o.Timeout)}
+	case last.pending > 0 || last.delivered:
+		return Result{Name: Drain, Level: Fail, Message: fmt.Sprintf(
+			"blue's vminsert pods were still delivering rows to vmstorage after %s: check blue's vmstorage nodes",
 			o.Timeout)}
 	}
 	if lastWrites == 0 {

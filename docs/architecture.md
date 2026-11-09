@@ -184,7 +184,7 @@ blind rerun.
 ```mermaid
 flowchart TD
     start(["sync --final --cutover-at Tcut"]) --> wait["wait until Tcut + 15m"]
-    wait --> drain{"does blue's vminsert accept<br/>no rows for one --drain-interval<br/>and hold none for vmstorage,<br/>within --drain-timeout?"}
+    wait --> drain{"does blue's vminsert accept<br/>no rows for one --drain-interval<br/>and deliver every row it accepted,<br/>within --drain-timeout?"}
     drain -- "no" --> fail(["FAIL: nothing copied,<br/>a writer still points at blue"])
     drain -- "unknown: pods restarted<br/>in every interval" --> unknown(["FAIL: nothing copied,<br/>rerun once pods are stable"])
     drain -- "yes, at Tdrained" --> copy["copy [min(SyncedUntil, Tcut) - overlap, Tdrained]<br/>(overlap is safe: green deduplicates)"]
