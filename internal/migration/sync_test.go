@@ -176,18 +176,18 @@ func TestSyncGivesUpAfterRetriesAreExhausted(t *testing.T) {
 	}
 }
 
-func TestFinalCopiesFromOneHourBeforeLastSyncToFifteenMinutesAfterCutover(t *testing.T) {
+func TestFinalCopiesFromOneHourBeforeLastSyncUntilBlueDrained(t *testing.T) {
 	st := &state.Memory{}
 	_, _ = st.Update(t.Context(), func(s *state.State) { *s = state.State{SyncedUntil: ts("2026-01-05T10:20:00Z")} })
 	c := &fakeCopier{}
 	s := newSyncer(c, st, ts("2026-01-05T11:00:00Z"))
 
-	w, err := s.Final(t.Context(), ts("2026-01-05T10:30:00Z"))
+	w, err := s.Final(t.Context(), ts("2026-01-05T10:30:00Z"), drainedAt(ts("2026-01-05T11:00:00Z")))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	want := windows("2026-01-05T09:20:00Z", "2026-01-05T10:45:00Z")
+	want := windows("2026-01-05T09:20:00Z", "2026-01-05T11:00:00Z")
 	assertWindows(t, []migration.Window{w}, want)
 	assertWindows(t, c.calls, want)
 	got, _ := st.Load(t.Context())
@@ -207,7 +207,7 @@ func TestFinalWaitsUntilFifteenMinutesAfterCutover(t *testing.T) {
 	var waits []time.Duration
 	s.Sleep = func(_ context.Context, d time.Duration) error { waits = append(waits, d); return nil }
 
-	if _, err := s.Final(t.Context(), ts("2026-01-05T10:30:00Z")); err != nil {
+	if _, err := s.Final(t.Context(), ts("2026-01-05T10:30:00Z"), drainedAt(ts("2026-01-05T10:45:00Z"))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -219,7 +219,7 @@ func TestFinalWaitsUntilFifteenMinutesAfterCutover(t *testing.T) {
 func TestFinalRefusesToRunBeforeAnySync(t *testing.T) {
 	s := newSyncer(&fakeCopier{}, &state.Memory{}, ts("2026-01-05T11:00:00Z"))
 
-	if _, err := s.Final(t.Context(), ts("2026-01-05T10:30:00Z")); err == nil {
+	if _, err := s.Final(t.Context(), ts("2026-01-05T10:30:00Z"), drainedAt(ts("2026-01-05T10:45:00Z"))); err == nil {
 		t.Fatal("want error when nothing was synced yet")
 	}
 }
@@ -337,7 +337,7 @@ func TestFinalRejectsACutoverInTheFuture(t *testing.T) {
 	c := &fakeCopier{}
 	s := newSyncer(c, st, ts("2026-01-05T11:00:00Z"))
 
-	if _, err := s.Final(t.Context(), ts("2026-01-15T10:30:00Z")); err == nil {
+	if _, err := s.Final(t.Context(), ts("2026-01-15T10:30:00Z"), drainedAt(ts("2026-01-05T11:00:00Z"))); err == nil {
 		t.Fatal("want an error for a cutover in the future instead of sleeping for days")
 	}
 	if len(c.calls) != 0 {
@@ -352,7 +352,7 @@ func TestFinalAfterACatchUpPastTheCutoverStillCopiesAroundTheCutover(t *testing.
 	c := &fakeCopier{}
 	s := newSyncer(c, st, ts("2026-01-05T15:00:00Z"))
 
-	w, err := s.Final(t.Context(), ts("2026-01-05T10:30:00Z"))
+	w, err := s.Final(t.Context(), ts("2026-01-05T10:30:00Z"), drainedAt(ts("2026-01-05T10:45:00Z")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,4 +364,81 @@ func TestFinalAfterACatchUpPastTheCutoverStillCopiesAroundTheCutover(t *testing.
 	if !got.SyncedUntil.Equal(ts("2026-01-05T14:00:00Z")) {
 		t.Errorf("SyncedUntil moved back to %v", got.SyncedUntil)
 	}
+}
+
+// drainedAt is a drain check that passes at t.
+func drainedAt(t time.Time) func(context.Context) (time.Time, error) {
+	return func(context.Context) (time.Time, error) { return t, nil }
+}
+
+func TestFinalChecksTheDrainAfterWaitingAndBeforeCopying(t *testing.T) {
+	st := &state.Memory{}
+	_, _ = st.Update(t.Context(), func(s *state.State) { s.SyncedUntil = ts("2026-01-05T10:20:00Z") })
+	var events []string
+	c := &fakeCopier{}
+	s := newSyncer(copierFunc(func(ctx context.Context, w migration.Window, r int64) (migration.CopyStats, error) {
+		events = append(events, "copy")
+		return c.Copy(ctx, w, r)
+	}), st, ts("2026-01-05T10:35:00Z"))
+	s.Sleep = func(_ context.Context, d time.Duration) error {
+		events = append(events, "wait "+d.String())
+		return nil
+	}
+
+	w, err := s.Final(t.Context(), ts("2026-01-05T10:30:00Z"), func(context.Context) (time.Time, error) {
+		events = append(events, "drain")
+		return ts("2026-01-05T10:52:00Z"), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.Equal(events, []string{"wait 10m0s", "drain", "copy"}) {
+		t.Errorf("events = %v, want the wait, then the drain check, then the copy", events)
+	}
+	// Writers that stopped late are covered up to the moment blue was drained.
+	assertWindows(t, []migration.Window{w}, windows("2026-01-05T09:20:00Z", "2026-01-05T10:52:00Z"))
+}
+
+func TestFinalCopiesNothingWhileBlueStillReceivesWrites(t *testing.T) {
+	st := &state.Memory{}
+	_, _ = st.Update(t.Context(), func(s *state.State) { s.SyncedUntil = ts("2026-01-05T10:20:00Z") })
+	c := &fakeCopier{}
+	s := newSyncer(c, st, ts("2026-01-05T11:00:00Z"))
+	notDrained := errors.New("blue still receives writes")
+
+	_, err := s.Final(t.Context(), ts("2026-01-05T10:30:00Z"), func(context.Context) (time.Time, error) {
+		return time.Time{}, notDrained
+	})
+
+	if !errors.Is(err, notDrained) {
+		t.Errorf("err = %v, want the drain error", err)
+	}
+	if got, _ := st.Load(t.Context()); len(c.calls) != 0 || !got.FinalStart.IsZero() {
+		t.Errorf("copied %v and recorded %+v before blue drained", c.calls, got)
+	}
+}
+
+func TestFinalRetryWithTheSameCutoverKeepsTheFirstWindowStart(t *testing.T) {
+	st := &state.Memory{}
+	_, _ = st.Update(t.Context(), func(s *state.State) { s.SyncedUntil = ts("2026-01-03T00:00:00Z") })
+	cutover := ts("2026-01-05T10:30:00Z")
+	s := newSyncer(&fakeCopier{}, st, ts("2026-01-05T11:00:00Z"))
+	if _, err := s.Final(t.Context(), cutover, drainedAt(ts("2026-01-05T11:00:00Z"))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify failed on an earlier day; the rerun must cover that day again although SyncedUntil moved on.
+	w, err := s.Final(t.Context(), cutover, drainedAt(ts("2026-01-05T11:30:00Z")))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertWindows(t, []migration.Window{w}, windows("2026-01-02T23:00:00Z", "2026-01-05T11:30:00Z"))
+}
+
+type copierFunc func(context.Context, migration.Window, int64) (migration.CopyStats, error)
+
+func (f copierFunc) Copy(ctx context.Context, w migration.Window, r int64) (migration.CopyStats, error) {
+	return f(ctx, w, r)
 }

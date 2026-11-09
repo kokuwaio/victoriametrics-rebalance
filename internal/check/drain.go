@@ -26,24 +26,32 @@ type DrainOptions struct {
 // WaitDrained measures blue's vminsert ingestion over windows of Interval until one window sees no rows at all, or
 // fails when blue still receives writes after Timeout. A writer that still points at blue writes data that is lost
 // once blue is deleted, so any row counts, not just a high rate. A writer that pushes less often than Interval can
-// slip through, so Interval must be longer than the slowest writer's push interval.
+// slip through, so Interval must be longer than the slowest writer's push interval. A window in which a vminsert pod
+// restarted, appeared or vanished proves nothing and is measured again.
 func WaitDrained(ctx context.Context, blue cluster.Client, o DrainOptions) Result {
 	if o.Interval <= 0 {
 		return Result{Name: Drain, Level: Fail, Message: "drain interval must be positive"}
 	}
 	attempts := max(1, int(o.Timeout/o.Interval))
-	var rate float64
+	var lastWrites float64 // the rate of the latest window that saw writes
 	for range attempts {
-		var err error
-		rate, err = insertRate(ctx, blue, o.Interval, o.Sleep, nil)
+		rate, complete, err := insertRate(ctx, blue, o.Interval, o.Sleep, nil)
 		if err != nil {
 			return Result{Name: Drain, Level: Fail, Message: err.Error()}
 		}
-		if rate == 0 {
+		if rate == 0 && complete {
 			return Result{Name: Drain, Level: Pass, Message: "blue receives no more writes"}
 		}
+		if rate > 0 {
+			lastWrites = rate
+		}
+	}
+	if lastWrites == 0 {
+		return Result{Name: Drain, Level: Fail, Message: fmt.Sprintf(
+			"blue's vminsert pods restarted or changed during every measurement within %s, so it is unknown whether "+
+				"blue still receives writes; wait until they are stable", o.Timeout)}
 	}
 	return Result{Name: Drain, Level: Fail, Message: fmt.Sprintf(
-		"blue still receives %.0f rows/s after %s: some writer still points at blue; find it before deleting blue",
-		rate, o.Timeout)}
+		"blue still received %.0f rows/s within %s: some writer still points at blue; point it at green",
+		lastWrites, o.Timeout)}
 }

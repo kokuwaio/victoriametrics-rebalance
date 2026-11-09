@@ -52,7 +52,7 @@ func TestCopyRunsVMCtlNativeModeForTheWindow(t *testing.T) {
 		"--vm-native-filter-time-start=2026-01-02T00:00:00Z",
 		"--vm-native-filter-time-end=2026-01-03T00:00:00Z",
 		"--vm-concurrency=2",
-		"--vm-rate-limit=52428800",
+		"--vm-rate-limit=26214400", // 50 MiB/s split across 2 workers
 	}
 	if r.name != "vmctl" || !slices.Equal(r.args, want) {
 		t.Errorf("ran %s %q\nwant vmctl %q", r.name, r.args, want)
@@ -123,6 +123,28 @@ func TestParseRate(t *testing.T) {
 	for _, in := range []string{"fast", "-1MB", "10XB"} {
 		if _, err := copier.ParseRate(in); err == nil {
 			t.Errorf("ParseRate(%q): want error", in)
+		}
+	}
+}
+
+func TestCopySplitsTheRateLimitAcrossVMCtlsWorkers(t *testing.T) {
+	for _, tc := range []struct {
+		concurrency int
+		want        string
+	}{
+		{0, "--vm-rate-limit=500"}, // vmctl's default of 2 workers
+		{4, "--vm-rate-limit=250"},
+		{2000, "--vm-rate-limit=1"},
+	} {
+		r := &fakeRunner{}
+		v := &copier.VMCtl{SrcAddr: "s", DstAddr: "d", Concurrency: tc.concurrency, Run: r.run}
+
+		if _, err := v.Copy(t.Context(), window, 1000); err != nil {
+			t.Fatal(err)
+		}
+
+		if !slices.Contains(r.args, tc.want) {
+			t.Errorf("concurrency %d: args %q lack %s", tc.concurrency, r.args, tc.want)
 		}
 	}
 }

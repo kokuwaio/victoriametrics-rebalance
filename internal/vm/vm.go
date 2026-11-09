@@ -128,9 +128,10 @@ type NameCount struct {
 	Value int64  `json:"value"`
 }
 
-// TSDB returns the TSDB status of one day (UTC) with the topN metric names by series count.
+// TSDB returns the TSDB status of one day (UTC) with the topN metric names by series count. It fails instead of
+// returning a partial result when a vmstorage node is unavailable.
 func TSDB(ctx context.Context, get Getter, day time.Time, topN int) (TSDBStatus, error) {
-	q := url.Values{"date": {day.UTC().Format(time.DateOnly)}, "topN": {strconv.Itoa(topN)}}
+	q := url.Values{"date": {day.UTC().Format(time.DateOnly)}, "topN": {strconv.Itoa(topN)}, "deny_partial_response": {"1"}}
 	body, err := get(ctx, "api/v1/status/tsdb", q)
 	if err != nil {
 		return TSDBStatus{}, err
@@ -150,9 +151,14 @@ func TSDB(ctx context.Context, get Getter, day time.Time, topN int) (TSDBStatus,
 }
 
 // QuerySum runs an instant query at t, bypassing the rollup cache, and returns the sum of all result values
-// (0 for an empty result).
+// (0 for an empty result). It fails instead of returning a partial result when a vmstorage node is unavailable.
 func QuerySum(ctx context.Context, get Getter, query string, t time.Time) (float64, error) {
-	q := url.Values{"query": {query}, "time": {strconv.FormatInt(t.Unix(), 10)}, "nocache": {"1"}}
+	q := url.Values{
+		"query":                 {query},
+		"time":                  {strconv.FormatInt(t.Unix(), 10)},
+		"nocache":               {"1"},
+		"deny_partial_response": {"1"},
+	}
 	body, err := get(ctx, "api/v1/query", q)
 	if err != nil {
 		return 0, err

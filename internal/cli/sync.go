@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/VictoriaMetrics/metrics"
@@ -54,9 +55,11 @@ chunk is recorded in the state, so a restarted run continues where the last one 
 The first run starts at now - retention. Later runs continue from the last finished chunk up to --until. Repeat
 sync (catch-up) until one run takes only minutes, then switch the read and write aliases to green.
 
-sync --final runs after the cutover. It copies [last synced point - 1h, cutover + 15m] (from cutover - 1h if a
-catch-up already ran past the cutover), waiting until that time has passed. Then it resets the rollup result cache
-on every green vmselect pod, checks that blue no longer receives writes, and verifies the days it copied.`,
+sync --final runs after the cutover. It waits until cutover + 15m and checks that blue no longer receives writes;
+if it still does, it stops without copying. Then it copies [last synced point - 1h, the moment blue was drained]
+(from cutover - 1h if a catch-up already ran past the cutover), resets the rollup result cache on every green
+vmselect pod, and verifies the days it copied. A rerun with the same --cutover-at covers the first run's window
+again.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runSync(cmd, g, o)
 		},
@@ -65,14 +68,14 @@ on every green vmselect pod, checks that blue no longer receives writes, and ver
 	f.StringVar(&o.until, "until", "now", `copy up to this time ("now" or RFC 3339)`)
 	f.StringVar(&o.since, "since", "", "on the first run, start here instead of now - retention (RFC 3339)")
 	f.BoolVar(&o.final, "final", false, "run the final sync after cutover")
-	f.StringVar(&o.cutoverAt, "cutover-at", "", `with --final (required): when the aliases were switched to green (RFC 3339, or "now")`)
+	f.StringVar(&o.cutoverAt, "cutover-at", "", "with --final (required): when the aliases were switched to green (RFC 3339)")
 	f.DurationVar(&o.step, "step", 24*time.Hour, "chunk size")
 	f.IntVar(&o.retries, "retries", 3, "retries per failed chunk")
 	f.DurationVar(&o.backoff, "backoff", time.Minute, "wait before the first retry; doubles with every further retry")
 	f.StringVar(&o.vmctl, "vmctl", "vmctl", "path to the vmctl binary")
 	f.StringArrayVar(&o.vmctlArgs, "vmctl-arg", nil, "extra argument for vmctl, e.g. --vmctl-arg=--vm-native-disable-http-keep-alive (repeatable)")
 	f.IntVar(&o.concurrency, "concurrency", 2, "vmctl import workers (--vm-concurrency)")
-	f.StringVar(&o.rateLimit, "rate-limit", "", "transfer rate limit, e.g. 50MiB/s (default: none); with --adaptive the highest rate")
+	f.StringVar(&o.rateLimit, "rate-limit", "", "total transfer rate limit across all vmctl workers, e.g. 50MiB/s (default: none); with --adaptive the highest rate")
 	f.BoolVar(&o.adaptive, "adaptive", false, "lower the rate limit while blue's vmselect is busy, checked before every chunk (needs --rate-limit; use a small --step such as 1h)")
 	f.StringVar(&o.minRateLimit, "min-rate-limit", "", "with --adaptive: the lowest rate (default: a tenth of --rate-limit)")
 	f.Float64Var(&o.maxUtilization, "max-select-utilization", 0.8, "with --adaptive: share of blue's vmselect query slots in use above which blue counts as busy")
@@ -80,7 +83,7 @@ on every green vmselect pod, checks that blue no longer receives writes, and ver
 	f.StringVar(&o.metricsAddr, "metrics-addr", "", "serve the tool's Prometheus metrics on this address, e.g. :8080 (default: off)")
 	f.StringVar(&o.srcURL, "from-select-url", "", "blue's vmselect URL for vmctl, e.g. after a port-forward (default: the Service URL)")
 	f.StringVar(&o.dstURL, "to-insert-url", "", "green's vminsert URL for vmctl, e.g. after a port-forward (default: the Service URL)")
-	f.DurationVar(&o.drain.Timeout, "drain-timeout", 20*time.Minute, "with --final: how long blue may still receive writes after the final sync")
+	f.DurationVar(&o.drain.Timeout, "drain-timeout", 20*time.Minute, "with --final: how long blue may still receive writes after cutover + 15m")
 	f.DurationVar(&o.drain.Interval, "drain-interval", 5*time.Minute, "with --final: blue must receive no writes for this long; make it longer than the push interval of your slowest writer")
 	o.verify.register(cmd)
 	return cmd
@@ -92,6 +95,16 @@ func runSync(cmd *cobra.Command, g *globalOptions, o *syncOptions) error {
 	}
 	if o.final && (o.cutoverAt == "" || o.drain.Interval <= 0 || o.drain.Timeout <= 0) {
 		return errors.New("--final needs --cutover-at, and positive --drain-interval and --drain-timeout")
+	}
+	if o.final {
+		if err := o.verify.validate(); err != nil {
+			return err
+		}
+	}
+	for _, a := range o.vmctlArgs {
+		if strings.HasPrefix(a, "--vm-concurrency") || strings.HasPrefix(a, "--vm-rate-limit") {
+			return fmt.Errorf("--vmctl-arg=%s: use --concurrency and --rate-limit, which split the limit across workers", a)
+		}
 	}
 	e, err := g.setup(cmd, true)
 	if err != nil {
@@ -239,23 +252,41 @@ func serveMetrics(addr string, set *metrics.Set, log *slog.Logger) (stop func(),
 	return func() { _ = srv.Close() }, nil
 }
 
-// runFinal runs the last sync after cutover, then the post-cutover checks.
+var errNotDrained = errors.New("blue still receives writes")
+
+// runFinal checks that blue is drained, runs the last sync, then the post-cutover checks.
 func runFinal(ctx context.Context, e *env, o *syncOptions, syncer *migration.Syncer) error {
+	if o.cutoverAt == "now" {
+		// A rerun must name the same cutover to cover the first run's window again.
+		return errors.New(`--cutover-at needs the RFC 3339 time you switched the aliases, not "now"`)
+	}
 	cutover, err := parseTime("--cutover-at", o.cutoverAt, time.Now())
 	if err != nil {
 		return err
 	}
-	w, err := syncer.Final(ctx, cutover)
+	var drain check.Result
+	w, err := syncer.Final(ctx, cutover, func(ctx context.Context) (time.Time, error) {
+		e.log.Info("checking that blue receives no more writes", "interval", o.drain.Interval, "timeout", o.drain.Timeout)
+		drain = check.WaitDrained(ctx, e.blue, o.drain)
+		if drain.Level == check.Fail {
+			return time.Time{}, errNotDrained
+		}
+		return syncer.Now(), nil
+	})
+	if errors.Is(err, errNotDrained) {
+		printReport(e.out, []check.Result{drain})
+		fmt.Fprintln(e.out, "\nNothing copied. Fix the cause above, then run sync --final again with the same --cutover-at.")
+		return errChecksFailed
+	}
 	if err != nil {
 		return err
 	}
 	e.log.Info("final sync copied", "window", w.String())
 
-	results := []check.Result{{Name: check.RollupCache, Level: check.Pass, Message: "reset on every green vmselect pod"}}
+	results := []check.Result{drain, {Name: check.RollupCache, Level: check.Pass, Message: "reset on every green vmselect pod"}}
 	if err := cluster.ResetRollupCache(ctx, e.green); err != nil {
-		results[0].Level, results[0].Message = check.Fail, err.Error()
+		results[1].Level, results[1].Message = check.Fail, err.Error()
 	}
-	results = append(results, check.WaitDrained(ctx, e.blue, o.drain))
 	days, err := verifyDays(ctx, e, o.verify, w.Start, w.End)
 	results = append(results, days...)
 	printReport(e.out, results)

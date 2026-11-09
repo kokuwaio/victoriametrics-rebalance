@@ -26,7 +26,7 @@ rules:
   - apiGroups: [""]
     resources: [pods/proxy, services/proxy]
     verbs: [get]
-  # The state: one ConfigMap per migration, vmrebalance-<from>-<to>.
+  # The state: one ConfigMap per migration and tenant, vmrebalance-<from>-<to>[-<tenant>].
   - apiGroups: [""]
     resources: [configmaps]
     verbs: [get, create, update]

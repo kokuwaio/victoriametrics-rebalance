@@ -32,6 +32,9 @@ func (s *selectAPI) get(path string, q url.Values) (string, error) {
 		if q.Get("date") != day.Format(time.DateOnly) {
 			return "", errors.New("unexpected date " + q.Get("date"))
 		}
+		if q.Get("deny_partial_response") != "1" {
+			return "", errors.New("TSDB status may be partial: deny_partial_response not set")
+		}
 		top := s.names
 		if n := q.Get("topN"); n != "" {
 			var limit int
@@ -126,8 +129,8 @@ func TestVerifyDayPassesWhenSeriesAndSampledCountsMatch(t *testing.T) {
 	}
 	q := g.queries[0]
 	if !strings.Contains(q.Get("query"), "count_over_time") || !strings.Contains(q.Get("query"), "[86400s]") ||
-		q.Get("time") != "1767398400" || q.Get("nocache") != "1" {
-		t.Errorf("query = %v, want count_over_time over the day at its end, bypassing the cache", q)
+		q.Get("time") != "1767398400" || q.Get("nocache") != "1" || q.Get("deny_partial_response") != "1" {
+		t.Errorf("query = %v, want count_over_time over the day at its end, bypassing the cache, never partial", q)
 	}
 }
 

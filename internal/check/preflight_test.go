@@ -88,6 +88,8 @@ func TestPreflightFindsProblems(t *testing.T) {
 			check.ReplicationFactor, check.Fail, "2"},
 		{"no dedup on vmselect", func(_, g *fakeCluster) { delete(g.info.Args, cluster.Select) },
 			check.Dedup, check.Fail, "vmselect"},
+		{"dedup disabled on vmstorage", func(_, g *fakeCluster) { g.info.Args[cluster.Storage]["dedup.minScrapeInterval"] = "0s" },
+			check.Dedup, check.Fail, "disabled"},
 		{"dedup thins real samples", func(_, g *fakeCluster) {
 			g.info.Args[cluster.Storage]["dedup.minScrapeInterval"] = "30s"
 			g.info.Args[cluster.Select]["dedup.minScrapeInterval"] = "30s"
@@ -103,6 +105,11 @@ func TestPreflightFindsProblems(t *testing.T) {
 		{"PDB selects pods of both clusters", func(b, _ *fakeCluster) {
 			b.pdbs = append(b.pdbs, pdb("vmstorage", map[string]string{"app.kubernetes.io/name": "vmstorage"}))
 		}, check.PodLabels, check.Fail, "PodDisruptionBudget vmstorage"},
+		{"PDB with an empty selector selects every pod", func(b, _ *fakeCluster) {
+			p := pdb("everything", nil)
+			p.Spec.Selector = &metav1.LabelSelector{}
+			b.pdbs = append(b.pdbs, p)
+		}, check.PodLabels, check.Fail, "PodDisruptionBudget everything"},
 		{"topology spread selector of blue matches green pods", func(b, _ *fakeCluster) {
 			b.pods[cluster.Storage][0].Spec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{{
 				TopologyKey:   "kubernetes.io/hostname",

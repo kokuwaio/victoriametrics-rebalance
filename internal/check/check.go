@@ -65,28 +65,35 @@ const rowsInserted = "vm_rows_inserted_total"
 type Sleeper func(ctx context.Context, d time.Duration) error
 
 // insertRate measures the rows per second a cluster's vminsert pods accept, from two scrapes of
-// vm_rows_inserted_total window apart. keep filters the counters by their labels (nil keeps all). Pods that
-// restarted between the scrapes (counter went down) or appeared only in one scrape are skipped.
+// vm_rows_inserted_total window apart. keep filters the counters by their labels (nil keeps all).
+//
+// Pods that restarted between the scrapes (counter went down) or appeared or vanished in between are left out of
+// the rate, and complete is false: what those pods received is unknown, so a rate of 0 doesn't prove there were no
+// writes.
 func insertRate(ctx context.Context, c cluster.Client, window time.Duration, sleep Sleeper,
-	keep func(map[string]string) bool) (float64, error) {
+	keep func(map[string]string) bool) (rate float64, complete bool, err error) {
 	before, err := scrape(ctx, c, cluster.Insert, rowsInserted, keep)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if err := sleep(ctx, window); err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	after, err := scrape(ctx, c, cluster.Insert, rowsInserted, keep)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	var rows float64
+	complete = len(before) == len(after)
 	for pod, a := range after {
-		if b, ok := before[pod]; ok && a >= b {
-			rows += a - b
+		b, ok := before[pod]
+		if !ok || a < b {
+			complete = false
+			continue
 		}
+		rows += a - b
 	}
-	return rows / window.Seconds(), nil
+	return rows / window.Seconds(), complete, nil
 }
 
 // scrape reads /metrics from every running pod of a component and returns, per pod name, the sum of the samples

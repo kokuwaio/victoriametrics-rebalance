@@ -151,14 +151,23 @@ func containerImage(p corev1.Pod, name string) string {
 // dedup checks that green drops samples with equal timestamps, which makes overlapping sync windows safe.
 // VictoriaMetrics cluster needs the flag on vmselect and vmstorage.
 func dedup(r *Report, g cluster.Info) {
-	var missing []string
+	var missing, disabled []string
 	for _, c := range []cluster.Component{cluster.Storage, cluster.Select} {
-		if g.Args[c][dedupFlag] == "" {
+		v := g.Args[c][dedupFlag]
+		if v == "" {
 			missing = append(missing, string(c))
+			continue
+		}
+		if d, err := time.ParseDuration(v); err != nil || d <= 0 {
+			disabled = append(disabled, fmt.Sprintf("%s (%s)", c, v))
 		}
 	}
 	if len(missing) > 0 {
 		r.add(Dedup, Fail, "green has no -%s on %s; set it to 1ms", dedupFlag, strings.Join(missing, " and "))
+		return
+	}
+	if len(disabled) > 0 {
+		r.add(Dedup, Fail, "green has -%s disabled or invalid on %s; set it to 1ms", dedupFlag, strings.Join(disabled, " and "))
 		return
 	}
 	st, sel := g.Args[cluster.Storage][dedupFlag], g.Args[cluster.Select][dedupFlag]
@@ -196,17 +205,18 @@ func capacity(ctx context.Context, r *Report, blue, green cluster.Client, headro
 // dualWrite checks that green receives live writes. Rows imported in native format are left out on green, because
 // that's what the tool's own sync sends.
 func dualWrite(ctx context.Context, r *Report, blue, green cluster.Client, o PreflightOptions) {
-	// Measure both clusters over the same window, so the share is comparable.
+	// Measure both clusters over the same window, so the share is comparable. The share is an estimate, so pods
+	// that restarted during the window are just left out.
 	type rate struct {
 		v   float64
 		err error
 	}
 	done := make(chan rate, 1)
 	go func() {
-		v, err := insertRate(ctx, blue, o.RateWindow, o.Sleep, nil)
+		v, _, err := insertRate(ctx, blue, o.RateWindow, o.Sleep, nil)
 		done <- rate{v, err}
 	}()
-	gr, gerr := insertRate(ctx, green, o.RateWindow, o.Sleep, func(l map[string]string) bool { return l["type"] != "native" })
+	gr, _, gerr := insertRate(ctx, green, o.RateWindow, o.Sleep, func(l map[string]string) bool { return l["type"] != "native" })
 	b := <-done
 	br := b.v
 	if err := firstErr(b.err, gerr); err != nil {
@@ -254,9 +264,10 @@ func podLabels(ctx context.Context, r *Report, blue, green cluster.Client) {
 		return
 	}
 	var problems []string
+	// A nil selector matches nothing; an empty one ({}) in a PodDisruptionBudget matches every pod.
 	overlaps := func(sel *metav1.LabelSelector) bool {
 		s, err := metav1.LabelSelectorAsSelector(sel)
-		return err == nil && !s.Empty() && matchesAny(s, bluePods) && matchesAny(s, greenPods)
+		return err == nil && matchesAny(s, bluePods) && matchesAny(s, greenPods)
 	}
 
 	seen := map[string]bool{}

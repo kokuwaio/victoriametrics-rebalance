@@ -17,6 +17,8 @@ const MaxChunks = 500
 type State struct {
 	From string `json:"from"`
 	To   string `json:"to"`
+	// Tenant is the tenant the migration copies. Empty means tenant 0.
+	Tenant string `json:"tenant,omitempty"`
 
 	// DualWriteSeenAt is when preflight first saw green receive live writes (T0, or a little after it).
 	DualWriteSeenAt time.Time `json:"dualWriteSeenAt,omitzero"`

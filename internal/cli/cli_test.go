@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kokuwaio/victoriametrics-rebalance/internal/check"
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/migration"
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/state"
 )
@@ -82,6 +83,26 @@ func TestNewPacer(t *testing.T) {
 		"minimum above maximum":       {syncOptions{adaptive: true, maxUtilization: 0.8, minRateLimit: "2KB"}, 1000},
 	} {
 		if _, err := newPacer(e, &tc.o, tc.rate, nil); err == nil {
+			t.Errorf("%s: want an error", name)
+		}
+	}
+}
+
+func TestVerifyFlagsRejectNegativeCountsAndBadTolerance(t *testing.T) {
+	ok := verifyFlags{check.VerifyOptions{TopN: 10, RandomN: 10, Pool: 1000, Tolerance: 0.01}}
+	if err := ok.validate(); err != nil {
+		t.Errorf("defaults: %v", err)
+	}
+	for name, change := range map[string]func(*verifyFlags){
+		"negative --top-n":    func(v *verifyFlags) { v.TopN = -1 },
+		"negative --random-n": func(v *verifyFlags) { v.RandomN = -1 },
+		"negative --pool":     func(v *verifyFlags) { v.Pool = -1 },
+		"tolerance of 100%":   func(v *verifyFlags) { v.Tolerance = 1 },
+		"negative tolerance":  func(v *verifyFlags) { v.Tolerance = -0.1 },
+	} {
+		v := ok
+		change(&v)
+		if err := v.validate(); err == nil {
 			t.Errorf("%s: want an error", name)
 		}
 	}

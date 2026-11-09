@@ -36,8 +36,8 @@ time ─────────────────────────
                      T0                                    Tc  Tcut
 blue   ═══ reads + writes ═══════════════════════════════════════╪═ soak (no writes) ══ delete
 green                ├─ dual write from vmagent ─────────────────┼═ all reads + writes ═══════▶
-sync   [ backfill: now-retention ── now ][ catch-up ── Tc ]      [ final: Tc-1h ── Tcut+15m ]
-                                                                  └ cache reset, drain check, verify
+sync   [ backfill: now-retention ── now ][ catch-up ── Tc ]      [ final: Tc-1h ── drained ]
+                                                                  └ drain check first, then copy, cache reset, verify
 ```
 
 | Step | Who | What |
@@ -50,7 +50,7 @@ sync   [ backfill: now-retention ── now ][ catch-up ── Tc ]      [ final
 | 6. `verify` | tool | Compares blue and green per day. |
 | 7. `sync` | tool | Catch-up: copies from the last synced point to now. Repeat until a run takes only minutes. |
 | 8. Cutover | you | Point the read and write aliases at green. This is Tcut. |
-| 9. `sync --final` | tool | Copies `[last synced point - 1h, Tcut + 15m]` (from `Tcut - 1h` if a catch-up already ran past the cutover), resets green's rollup cache, checks that blue no longer receives writes, and verifies the copied days. |
+| 9. `sync --final` | tool | Waits until `Tcut + 15m` and checks that blue no longer receives writes (if it still does, it stops without copying). Then copies `[last synced point - 1h, the moment blue was drained]` (from `Tcut - 1h` if a catch-up already ran past the cutover), resets green's rollup cache, and verifies the copied days. |
 | 10. Soak and delete | you | Keep blue for a few days so you can roll back, then delete blue and its PVCs. |
 
 Why dual write *and* a final sync:
@@ -109,16 +109,18 @@ Run `vmrebalance <command> --help` for all flags. The most important ones:
 - `sync --step 24h`: the chunk size. Every finished chunk is recorded, so a restarted run continues with the first
   unfinished one.
 - `sync --rate-limit 50MiB/s --concurrency 2`: the export reads go through blue's vmselect and vmstorage and compete
-  with real queries. Start low and watch blue's load.
+  with real queries. Start low and watch blue's load. The limit is the total: vmctl applies its rate limit per
+  worker, so the tool divides it by `--concurrency`.
 - `sync --adaptive`: halve the rate while blue's vmselect is busy (queries wait for a slot, or most slots are in use),
   and raise it again when it isn't. Latency counts only if you set `--max-query-latency`, e.g. `5s`; it is off by
-  default. The rate changes between chunks, so
-  combine it with a small `--step`. See [docs/architecture.md](docs/architecture.md#adaptive-rate-limit).
+  default. The rate changes between chunks, so combine it with a small `--step`. See
+  [docs/architecture.md](docs/architecture.md#adaptive-rate-limit).
 - `sync --metrics-addr :8080`: serve the tool's Prometheus metrics (progress, rate limit, blue's load).
 - `sync --final --cutover-at <time>`: the time you switched the aliases. The final window is measured from it.
   `--drain-interval` (default 5m) must be longer than the push interval of your slowest writer: blue passes only
   when it receives no rows at all during one whole interval.
-- `--state-file state.json`: keep the state in a local file instead of the ConfigMap `vmrebalance-<from>-<to>`.
+- `--state-file state.json`: keep the state in a local file instead of the ConfigMap `vmrebalance-<from>-<to>`
+  (`vmrebalance-<from>-<to>-<tenant>` for tenants other than 0; each tenant has its own state).
   This is fine on a workstation. A Job needs the ConfigMap, because its pod loses local files when it restarts.
 - `--access proxy|direct`: how the tool reaches vmselect and the pods. `proxy` goes through the Kubernetes API
   server and works from any workstation, but the API server cuts requests off after its request timeout (1 minute
@@ -153,9 +155,10 @@ from a workstation without port-forwarding.
   random set (counting every series is too expensive on large clusters). Green passes with at least as many series
   and samples as blue, minus a tolerance (default 1%). On the last, partial day only the sample counts are compared,
   because the day's series count also includes series written after the last synced point.
-- `sync --final`: rollup cache reset on every green vmselect pod, so no pod serves results cached before the
-  backfill; blue's vminsert receives no rows during one `--drain-interval` within `--drain-timeout`, otherwise some
-  writer still points at blue; `verify` for the days the final sync copied.
+- `sync --final`: before copying, blue's vminsert receives no rows during one `--drain-interval` within
+  `--drain-timeout`, otherwise some writer still points at blue (a window in which a vminsert pod restarted counts
+  as unknown and is measured again); rollup cache reset on every green vmselect pod, so no pod serves results
+  cached before the backfill; `verify` for the days the final sync copied, failing on partial responses.
 
 ## Risks
 

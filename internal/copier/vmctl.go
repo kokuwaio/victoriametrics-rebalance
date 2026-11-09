@@ -47,8 +47,8 @@ type VMCtl struct {
 // outputTail is how much of vmctl's output is kept for parsing the stats and for error messages.
 const outputTail = 64 << 10
 
-// Copy runs vmctl once for the window, capped at rateLimit bytes per second (0: no limit), and returns the bytes
-// it reports.
+// Copy runs vmctl once for the window, capped at rateLimit bytes per second in total across all workers (0: no
+// limit), and returns the bytes it reports.
 func (v *VMCtl) Copy(ctx context.Context, w migration.Window, rateLimit int64) (migration.CopyStats, error) {
 	tail := &tailBuffer{max: outputTail}
 	out := io.Writer(tail)
@@ -81,14 +81,21 @@ func (v *VMCtl) args(w migration.Window, rateLimit int64) []string {
 		"--vm-native-filter-time-start=" + w.Start.UTC().Format(time.RFC3339),
 		"--vm-native-filter-time-end=" + w.End.UTC().Format(time.RFC3339),
 	}
+	workers := vmctlDefaultConcurrency
 	if v.Concurrency > 0 {
+		workers = v.Concurrency
 		args = append(args, "--vm-concurrency="+strconv.Itoa(v.Concurrency))
 	}
 	if rateLimit > 0 {
-		args = append(args, "--vm-rate-limit="+strconv.FormatInt(rateLimit, 10))
+		// vmctl applies --vm-rate-limit to each worker's request, not to the whole process.
+		perWorker := max(1, rateLimit/int64(workers))
+		args = append(args, "--vm-rate-limit="+strconv.FormatInt(perWorker, 10))
 	}
 	return append(args, v.ExtraArgs...)
 }
+
+// vmctlDefaultConcurrency is vmctl's default for --vm-concurrency.
+const vmctlDefaultConcurrency = 2
 
 // vmctl prints "total bytes: 1.5 GB;" (SI units) when an import finishes.
 var totalBytesRE = regexp.MustCompile(`total bytes: ([0-9.]+) ([kMGTPE]?)B`)

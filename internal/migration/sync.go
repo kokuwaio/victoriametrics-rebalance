@@ -105,15 +105,19 @@ const (
 	// FinalOverlap is how far before the last synced point the final sync starts, to pick up samples that arrived
 	// late on blue. Overlaps are safe because green deduplicates samples with equal timestamps.
 	FinalOverlap = time.Hour
-	// FinalTail is how far past the cutover the final sync reaches, so writers that switched late are included.
+	// FinalTail is how long after the cutover the final sync waits before it checks that blue is drained, so
+	// writers that switched late have stopped.
 	FinalTail = 15 * time.Minute
 )
 
-// Final runs the last sync after cutover: [SyncedUntil - FinalOverlap, cutover + FinalTail]. When a catch-up already
-// ran past the cutover, the window starts at cutover - FinalOverlap instead, so the time around the cutover is
-// copied and verified either way. It waits until the end of the window has passed, records the cutover and the
-// window in the state and returns the window.
-func (s *Syncer) Final(ctx context.Context, cutover time.Time) (Window, error) {
+// Final runs the last sync after cutover. It waits until cutover + FinalTail, then calls drained, which returns
+// once blue receives no more writes and when that was. Only then does it copy
+// [SyncedUntil - FinalOverlap, max(cutover + FinalTail, drained)], so every sample blue received is copied. When a
+// catch-up already ran past the cutover, the window starts at cutover - FinalOverlap instead, so the time around
+// the cutover is copied and verified either way. A rerun for the same cutover keeps the start of the first run's
+// window, so days that failed to verify are copied and verified again. If drained fails, Final copies nothing and
+// returns its error. It records the cutover and the window in the state and returns the window.
+func (s *Syncer) Final(ctx context.Context, cutover time.Time, drained func(context.Context) (time.Time, error)) (Window, error) {
 	if err := s.validate(); err != nil {
 		return Window{}, err
 	}
@@ -133,11 +137,21 @@ func (s *Syncer) Final(ctx context.Context, cutover time.Time) (Window, error) {
 		from = cutover
 	}
 	w := Window{Start: from.Add(-FinalOverlap), End: cutover.Add(FinalTail)}
+	if st.CutoverAt.Equal(cutover) && !st.FinalStart.IsZero() && st.FinalStart.Before(w.Start) {
+		w.Start = st.FinalStart
+	}
 	if wait := w.End.Sub(s.Now()); wait > 0 {
-		s.log().Info("waiting for the end of the final window", "until", w.End, "wait", wait)
+		s.log().Info("waiting for late writers to switch to green", "until", w.End, "wait", wait)
 		if err := s.Sleep(ctx, wait); err != nil {
 			return Window{}, err
 		}
+	}
+	at, err := drained(ctx)
+	if err != nil {
+		return Window{}, err
+	}
+	if at.After(w.End) {
+		w.End = at
 	}
 	if _, err := s.Store.Update(ctx, func(st *state.State) {
 		st.CutoverAt = cutover

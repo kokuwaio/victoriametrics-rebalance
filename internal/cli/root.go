@@ -56,7 +56,7 @@ write and switch the aliases (usually in Git); the tool copies the data, checks 
 	f.StringVar(&g.to, "to", "", "name of the new VMCluster (green)")
 	f.StringVar(&g.tenant, "tenant", "0", "tenant ID to copy and check")
 	f.StringVar(&g.access, "access", "auto", "how to reach vmselect and pods: proxy (through the API server), direct (Service DNS and pod IPs), or auto (direct in a pod, proxy otherwise)")
-	f.StringVar(&g.stateFile, "state-file", "", "keep the state in this local file instead of the ConfigMap vmrebalance-<from>-<to>")
+	f.StringVar(&g.stateFile, "state-file", "", "keep the state in this local file instead of the ConfigMap vmrebalance-<from>-<to> (with -<tenant> for tenants other than 0)")
 	f.BoolVarP(&g.verbose, "verbose", "v", false, "log debug output")
 	_ = root.MarkPersistentFlagRequired("from")
 	_ = root.MarkPersistentFlagRequired("to")
@@ -132,10 +132,11 @@ func (g *globalOptions) setup(cmd *cobra.Command, clusters bool) (*env, error) {
 		return nil, fmt.Errorf("--access must be auto, proxy or direct, not %q", g.access)
 	}
 
+	m := state.Migration{From: g.from, To: g.to, Tenant: g.tenant}
 	if g.stateFile != "" {
-		e.store = state.NewFile(g.stateFile, g.from, g.to)
+		e.store = state.NewFile(g.stateFile, m)
 	} else {
-		e.store = state.NewConfigMap(e.kube, e.namespace, g.from, g.to)
+		e.store = state.NewConfigMap(e.kube, e.namespace, m)
 	}
 
 	if clusters {

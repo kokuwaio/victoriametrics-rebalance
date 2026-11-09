@@ -3,6 +3,7 @@ package state_test
 import (
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +18,8 @@ import (
 )
 
 var synced = time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+
+var bg = state.Migration{From: "blue", To: "green", Tenant: "0"}
 
 func sample() *state.State {
 	s := &state.State{From: "blue", To: "green", BackfillStart: synced.Add(-24 * time.Hour)}
@@ -78,7 +81,7 @@ func assertRoundTrip(t *testing.T, got *state.State) {
 }
 
 func TestConfigMapStoreLoadsEmptyStateBeforeTheFirstSave(t *testing.T) {
-	s := state.NewConfigMap(apiServer(), "monitoring", "blue", "green")
+	s := state.NewConfigMap(apiServer(), "monitoring", bg)
 
 	got, err := s.Load(t.Context())
 	if err != nil {
@@ -92,7 +95,7 @@ func TestConfigMapStoreLoadsEmptyStateBeforeTheFirstSave(t *testing.T) {
 
 func TestConfigMapStoreRoundTrip(t *testing.T) {
 	cs := apiServer()
-	s := state.NewConfigMap(cs, "monitoring", "blue", "green")
+	s := state.NewConfigMap(cs, "monitoring", bg)
 	if _, err := s.Load(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +108,7 @@ func TestConfigMapStoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := state.NewConfigMap(cs, "monitoring", "blue", "green").Load(t.Context())
+	got, err := state.NewConfigMap(cs, "monitoring", bg).Load(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +127,7 @@ func TestConfigMapStoreUpdateKeepsAConcurrentWritersChanges(t *testing.T) {
 	cs := apiServerWithInterleave(func(cm *corev1.ConfigMap) {
 		cm.Data["state.json"] = `{"from":"blue","to":"green","verifications":{"2026-01-01":{"pass":true,"blueSeries":1,"greenSeries":1,"checkedAt":"2026-01-02T00:00:00Z"}}}`
 	})
-	s := state.NewConfigMap(cs, "monitoring", "blue", "green")
+	s := state.NewConfigMap(cs, "monitoring", bg)
 	if _, err := s.Update(t.Context(), func(*state.State) {}); err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +142,7 @@ func TestConfigMapStoreUpdateKeepsAConcurrentWritersChanges(t *testing.T) {
 	if !got.SyncedUntil.Equal(synced) || !got.Verifications["2026-01-01"].Pass {
 		t.Errorf("want both the chunk and the other writer's verification, got %+v", got)
 	}
-	stored, _ := state.NewConfigMap(cs, "monitoring", "blue", "green").Load(t.Context())
+	stored, _ := state.NewConfigMap(cs, "monitoring", bg).Load(t.Context())
 	if !stored.SyncedUntil.Equal(synced) || !stored.Verifications["2026-01-01"].Pass {
 		t.Errorf("stored state lost a change: %+v", stored)
 	}
@@ -147,7 +150,7 @@ func TestConfigMapStoreUpdateKeepsAConcurrentWritersChanges(t *testing.T) {
 
 func TestFileStoreRoundTripAndEmptyStateForAMissingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	s := state.NewFile(path, "blue", "green")
+	s := state.NewFile(path, bg)
 
 	empty, err := s.Load(t.Context())
 	if err != nil || empty.From != "blue" || empty.To != "green" || !empty.SyncedUntil.IsZero() {
@@ -157,9 +160,33 @@ func TestFileStoreRoundTripAndEmptyStateForAMissingFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := state.NewFile(path, "blue", "green").Load(t.Context())
+	got, err := state.NewFile(path, bg).Load(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertRoundTrip(t, got)
+}
+
+func TestEachTenantHasItsOwnState(t *testing.T) {
+	cs := apiServer()
+	if _, err := state.NewConfigMap(cs, "monitoring", bg).Update(t.Context(), func(st *state.State) { st.SyncedUntil = synced }); err != nil {
+		t.Fatal(err)
+	}
+
+	other := state.Migration{From: "blue", To: "green", Tenant: "1:2"}
+	got, err := state.NewConfigMap(cs, "monitoring", other).Load(t.Context())
+	if err != nil || !got.SyncedUntil.IsZero() {
+		t.Errorf("tenant 1:2 loaded %+v, %v; want an empty state, not tenant 0's progress", got, err)
+	}
+	if name := state.Name(other); name != "vmrebalance-blue-green-1-2" {
+		t.Errorf("name = %s", name)
+	}
+
+	path := filepath.Join(t.TempDir(), "state.json")
+	if _, err := state.NewFile(path, bg).Update(t.Context(), func(st *state.State) { st.SyncedUntil = synced }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.NewFile(path, other).Load(t.Context()); err == nil || !strings.Contains(err.Error(), "tenant 0") {
+		t.Errorf("loading tenant 0's state file as tenant 1:2: err = %v, want a mismatch error", err)
+	}
 }

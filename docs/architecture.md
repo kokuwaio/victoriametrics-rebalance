@@ -28,7 +28,7 @@ the tool works and why it is built this way.
 - **Same version on blue and green.** The native format is version-coupled, so `preflight` compares the image tags
   of all running components.
 - **Dual write plus a final sync, with deduplication.** Dual write keeps green current without a gap, and the final
-  sync covers writers that bypass VMAgent. The windows overlap on purpose (`[last sync - 1h, cutover + 15m]`).
+  sync covers writers that bypass VMAgent. The windows overlap on purpose (`[last sync - 1h, blue drained]`).
   That is safe only because green runs with `-dedup.minScrapeInterval=1ms`, which `preflight` checks.
 - **Time-ordered chunks with a high-water mark.** Chunks run oldest first and one at a time, so the state needs only
   the end of the last finished chunk to resume. Backfill and catch-up are the same operation: copy from the
@@ -149,7 +149,7 @@ sequenceDiagram
         G->>B: GET /metrics on every pod
         B-->>G: query slots in use, waits, p99 latency
         G-->>S: rate limit (halved if busy, +10% of max if not)
-        S->>V: vm-native, time filter = chunk, --vm-rate-limit
+        S->>V: vm-native, time filter = chunk, --vm-rate-limit = rate / workers
         V->>B: GET /api/v1/export/native
         B-->>V: native blocks
         V->>GI: POST /api/v1/import/native
@@ -167,29 +167,36 @@ Chunk boundaries are aligned to `--step`, so a day step cuts at UTC midnight.
 
 ## The final sync
 
-The final sync refuses a cutover time in the future. If a catch-up already ran past the cutover, its window starts
-at `Tcut - 1h` instead of `SyncedUntil - 1h`, so the time around the cutover is always copied and verified. Run it
-in a Job that doesn't restart on failure ([deploy/job-final.yaml](../deploy/job-final.yaml)): a failed drain check
-or verify needs a person to look, not a rerun.
+The final sync refuses a cutover time in the future. It checks that blue is drained before it copies, and copies
+up to the moment the check passed, so samples from a writer that stopped late are not left on blue. If a catch-up
+already ran past the cutover, its window starts at `Tcut - 1h` instead of `SyncedUntil - 1h`, so the time around the
+cutover is always copied and verified. A rerun with the same cutover keeps the first run's window start, so a day
+that failed to verify is copied and verified again. Run it in a Job that doesn't restart on failure
+([deploy/job-final.yaml](../deploy/job-final.yaml)): a failed drain check or verify needs a person to look, not a
+blind rerun.
 
 ```mermaid
 flowchart TD
     start(["sync --final --cutover-at Tcut"]) --> wait["wait until Tcut + 15m"]
-    wait --> copy["copy [min(SyncedUntil, Tcut) - 1h, Tcut + 15m]<br/>(overlap is safe: green deduplicates)"]
+    wait --> drain{"does blue's vminsert accept<br/>no rows for one --drain-interval<br/>within --drain-timeout?"}
+    drain -- "no" --> fail(["FAIL: nothing copied,<br/>a writer still points at blue"])
+    drain -- "unknown: pods restarted<br/>in every interval" --> unknown(["FAIL: nothing copied,<br/>rerun once pods are stable"])
+    drain -- "yes, at Tdrained" --> copy["copy [min(SyncedUntil, Tcut) - 1h, Tdrained]<br/>(overlap is safe: green deduplicates)"]
     copy --> reset["reset the rollup result cache<br/>on every green vmselect pod"]
-    reset --> drain{"does blue's vminsert accept<br/>no rows for one --drain-interval<br/>within --drain-timeout?"}
-    drain -- "no" --> fail(["FAIL: a writer still points at blue"])
-    drain -- "yes" --> verify["verify the days the final sync copied"]
+    reset --> verify["verify the days the final sync copied<br/>(partial responses fail)"]
     verify --> ok(["Done: keep blue for rollback, then delete it"])
 ```
 
 ## State
 
-The state is one JSON document. By default it lives in the ConfigMap `vmrebalance-<from>-<to>` in the namespace of
-both clusters, which survives restarts of a Job's pod. With `--state-file` it lives in a local file instead.
+The state is one JSON document per migration and tenant. By default it lives in the ConfigMap
+`vmrebalance-<from>-<to>` (with `-<tenant>` appended for tenants other than 0) in the namespace of both clusters,
+which survives restarts of a Job's pod. With `--state-file` it lives in a local file instead. A state saved for
+another pair of clusters or another tenant is refused.
 
 | Field | Written by | Meaning |
 |---|---|---|
+| `from`, `to`, `tenant` | every command | Which migration the state belongs to. A state for another one is refused. |
 | `dualWriteSeenAt` | `preflight` | When green was first seen receiving live writes (T0, or a little after it). |
 | `backfillStart` | `sync` | Where the first sync started. |
 | `syncedUntil` | `sync` | End of the last finished chunk. The next sync continues here. |

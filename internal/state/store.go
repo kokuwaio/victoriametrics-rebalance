@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -29,21 +30,45 @@ type Store interface {
 	Update(ctx context.Context, change func(*State)) (*State, error)
 }
 
-// ConfigMap stores the state in the ConfigMap vmrebalance-<from>-<to>. It survives restarts of a Job's pod.
+// Migration identifies one migration: the two VMClusters and the tenant it copies. Each one has its own state.
+type Migration struct {
+	From, To string
+	// Tenant is the tenant ID, e.g. "0" or "1:2". Empty means "0".
+	Tenant string
+}
+
+func (m Migration) tenant() string {
+	if m.Tenant == "" {
+		return "0"
+	}
+	return m.Tenant
+}
+
+// empty returns the state of a migration that hasn't saved anything yet.
+func (m Migration) empty() *State { return &State{From: m.From, To: m.To, Tenant: m.tenant()} }
+
+// ConfigMap stores the state in the ConfigMap Name(m). It survives restarts of a Job's pod.
 type ConfigMap struct {
 	client    kubernetes.Interface
 	namespace string
 	name      string
-	from, to  string
+	m         Migration
 }
 
-// NewConfigMap returns a store for the migration from → to in namespace.
-func NewConfigMap(client kubernetes.Interface, namespace, from, to string) *ConfigMap {
-	return &ConfigMap{client: client, namespace: namespace, name: Name(from, to), from: from, to: to}
+// NewConfigMap returns a store for the migration m in namespace.
+func NewConfigMap(client kubernetes.Interface, namespace string, m Migration) *ConfigMap {
+	return &ConfigMap{client: client, namespace: namespace, name: Name(m), m: m}
 }
 
-// Name is the name of the ConfigMap that holds the state of the migration from → to.
-func Name(from, to string) string { return "vmrebalance-" + from + "-" + to }
+// Name is the name of the ConfigMap that holds the state of m: vmrebalance-<from>-<to> for tenant 0, with
+// -<tenant> appended for any other tenant (":" becomes "-").
+func Name(m Migration) string {
+	name := "vmrebalance-" + m.From + "-" + m.To
+	if t := m.tenant(); t != "0" {
+		name += "-" + strings.ReplaceAll(t, ":", "-")
+	}
+	return name
+}
 
 // Load reads the state, or returns an empty one if the ConfigMap doesn't exist yet.
 func (c *ConfigMap) Load(ctx context.Context) (*State, error) {
@@ -95,36 +120,36 @@ func (c *ConfigMap) Update(ctx context.Context, change func(*State)) (*State, er
 func (c *ConfigMap) get(ctx context.Context) (*State, *corev1.ConfigMap, error) {
 	cm, err := c.client.CoreV1().ConfigMaps(c.namespace).Get(ctx, c.name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		return &State{From: c.from, To: c.to}, nil, nil
+		return c.m.empty(), nil, nil
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("get ConfigMap %s/%s: %w", c.namespace, c.name, err)
 	}
-	s, err := decode([]byte(cm.Data[dataKey]), c.from, c.to)
+	s, err := decode([]byte(cm.Data[dataKey]), c.m)
 	return s, cm, err
 }
 
 // File stores the state in a local JSON file. Use it for runs from a workstation; a Job's pod loses its local
 // files when it is evicted or restarted. It doesn't guard against two processes writing at once.
 type File struct {
-	mu       sync.Mutex
-	path     string
-	from, to string
+	mu   sync.Mutex
+	path string
+	m    Migration
 }
 
-// NewFile returns a store backed by the file at path.
-func NewFile(path, from, to string) *File { return &File{path: path, from: from, to: to} }
+// NewFile returns a store for the migration m backed by the file at path.
+func NewFile(path string, m Migration) *File { return &File{path: path, m: m} }
 
 // Load reads the state, or returns an empty one if the file doesn't exist yet.
 func (f *File) Load(context.Context) (*State, error) {
 	data, err := os.ReadFile(f.path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return &State{From: f.from, To: f.to}, nil
+		return f.m.empty(), nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return decode(data, f.from, f.to)
+	return decode(data, f.m)
 }
 
 // Update applies change to the state in the file. It writes a temporary file and renames it over the old one, so a
@@ -156,16 +181,18 @@ func (f *File) Update(ctx context.Context, change func(*State)) (*State, error) 
 	return s, os.Rename(tmp.Name(), f.path)
 }
 
-func decode(data []byte, from, to string) (*State, error) {
+func decode(data []byte, m Migration) (*State, error) {
 	s := &State{}
 	if len(data) > 0 {
 		if err := json.Unmarshal(data, s); err != nil {
 			return nil, fmt.Errorf("decode state: %w", err)
 		}
 	}
-	if s.From != "" && (s.From != from || s.To != to) {
-		return nil, fmt.Errorf("state belongs to the migration %s → %s, not %s → %s", s.From, s.To, from, to)
+	saved := Migration{From: s.From, To: s.To, Tenant: s.Tenant}
+	if s.From != "" && (saved.From != m.From || saved.To != m.To || saved.tenant() != m.tenant()) {
+		return nil, fmt.Errorf("state belongs to the migration %s → %s of tenant %s, not %s → %s of tenant %s",
+			saved.From, saved.To, saved.tenant(), m.From, m.To, m.tenant())
 	}
-	s.From, s.To = from, to
+	s.From, s.To, s.Tenant = m.From, m.To, m.tenant()
 	return s, nil
 }

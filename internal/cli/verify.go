@@ -27,6 +27,16 @@ func (v *verifyFlags) register(cmd *cobra.Command) {
 	f.Float64Var(&v.Tolerance, "tolerance", 0.01, "verify: share by which green may fall short of blue (0.01 = 1%)")
 }
 
+func (v *verifyFlags) validate() error {
+	if v.TopN < 0 || v.RandomN < 0 || v.Pool < 0 {
+		return errors.New("--top-n, --random-n and --pool must not be negative")
+	}
+	if v.Tolerance < 0 || v.Tolerance >= 1 {
+		return errors.New("--tolerance must be a share between 0 and 1, e.g. 0.01")
+	}
+	return nil
+}
+
 func newVerify(g *globalOptions) *cobra.Command {
 	var v verifyFlags
 	var since, until string
@@ -41,6 +51,9 @@ By default it checks every day from the first full day after the backfill start 
 last day is usually partial: there only the sample counts up to the last synced point are compared, because the
 day's series count also includes series written afterwards.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := v.validate(); err != nil {
+				return err
+			}
 			e, err := g.setup(cmd, true)
 			if err != nil {
 				return err

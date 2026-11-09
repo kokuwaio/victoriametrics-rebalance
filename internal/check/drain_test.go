@@ -64,3 +64,41 @@ func TestResetRollupCacheCallsEveryVMSelectPod(t *testing.T) {
 		t.Errorf("calls = %v, want %v", green.podGets, want)
 	}
 }
+
+func TestDrainDoesNotPassWhenVMInsertPodsRestartDuringEveryMeasurement(t *testing.T) {
+	blue := newCluster("blue", 2)
+	// Every measurement sees the counter drop: the pod restarted, and how much it received since is unknown.
+	blue.setInserted([]int{1000, 50, 1000, 50, 1000, 50}, []int{0, 0, 0, 0, 0, 0})
+
+	res := check.WaitDrained(t.Context(), blue, drainOpts)
+
+	if res.Level != check.Fail || !strings.Contains(res.Message, "restarted") {
+		t.Errorf("drain = %s %q, want a failure saying the pods restarted", res.Level, res.Message)
+	}
+}
+
+func TestDrainMeasuresAgainAfterAPodRestart(t *testing.T) {
+	blue := newCluster("blue", 2)
+	blue.setInserted([]int{1000, 50, 50, 50}, []int{0, 0, 0, 0})
+
+	res := check.WaitDrained(t.Context(), blue, drainOpts)
+
+	if res.Level != check.Pass {
+		t.Errorf("drain = %s %q", res.Level, res.Message)
+	}
+	if n := len(blue.podGets); n != 4 {
+		t.Errorf("scraped %d times, want 2 measurements of 2 scrapes on the vminsert pod", n)
+	}
+}
+
+func TestDrainReportsTheWriterWhenTheLastMeasurementIsIncomplete(t *testing.T) {
+	blue := newCluster("blue", 2)
+	// Writes in the first two windows, then a restart in the last one.
+	blue.setInserted([]int{1000, 1600, 1600, 2200, 2200, 50}, []int{0, 0, 0, 0, 0, 0})
+
+	res := check.WaitDrained(t.Context(), blue, drainOpts)
+
+	if res.Level != check.Fail || !strings.Contains(res.Message, "10 rows/s") {
+		t.Errorf("drain = %s %q, want the writer's 10 rows/s, not an unknown result", res.Level, res.Message)
+	}
+}
