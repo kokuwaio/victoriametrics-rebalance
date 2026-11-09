@@ -177,9 +177,8 @@ up to the moment the check passed, so samples from a writer that stopped late ar
 already ran past the cutover, its window starts at `Tcut - 1h` instead of `SyncedUntil - 1h` (1h is the default of
 `--final-overlap`, which must cover the oldest timestamps that writers bypassing dual write still send), so the time
 around the cutover is always copied and verified. A rerun with the same cutover keeps the first run's window start,
-so a day that failed to verify is copied and verified again. Run it in a Job that doesn't restart on failure
-([deploy/job-final.yaml](../deploy/job-final.yaml)): a failed drain check or verify needs a person to look, not a
-blind rerun.
+so a day that failed to verify is copied and verified again. The Helm chart's `mode: final` runs it in a Job that
+doesn't restart on failure: a failed drain check or verify needs a person to look, not a blind rerun.
 
 ```mermaid
 flowchart TD

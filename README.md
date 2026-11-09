@@ -154,8 +154,36 @@ This builds `./bin/vmrebalance` and needs the Go version from [go.mod](go.mod). 
 
 ### Container image
 
-No image is published yet. `make image` builds one from the [Dockerfile](Dockerfile), with vmctl included, for
-running `sync` as a Job.
+The release workflow publishes `ghcr.io/kokuwaio/victoriametrics-rebalance` for linux/amd64 and linux/arm64,
+with vmctl included, for running `sync` as a Job. Tags: `vX.Y.Z`, `vX.Y`, `vX` (from 1.0 on) and `latest` for
+releases, and `main` for the latest commit on the main branch. GitHub creates the package as private: until it is
+made public in its package settings, the cluster needs an image pull secret for `ghcr.io`. `make image` builds the
+same image locally.
+
+### Helm chart
+
+The chart in [charts/vmrebalance](charts/vmrebalance) runs `sync` as a Job in the namespace of both VMClusters, with
+a ServiceAccount and a Role that has the permissions the tool needs. Every chart version that reaches `main` is
+published to `oci://ghcr.io/kokuwaio/charts/vmrebalance`:
+
+```sh
+helm install vmrebalance oci://ghcr.io/kokuwaio/charts/vmrebalance -n monitoring --set from=vmcluster --set to=vmcluster-b
+helm upgrade vmrebalance oci://ghcr.io/kokuwaio/charts/vmrebalance -n monitoring --reset-then-reuse-values
+helm upgrade vmrebalance oci://ghcr.io/kokuwaio/charts/vmrebalance -n monitoring --reset-then-reuse-values --set mode=final --set-string final.cutoverAt=2026-01-09T10:00:00Z
+```
+
+Every install or upgrade starts one Job, named `<release>-<mode>-<revision>`, and removes the previous one, also
+while it still runs: wait until a run has finished before the next upgrade (`kubectl wait --for=condition=Complete
+job/<name>`). The first Job is the backfill, later upgrades are catch-up runs, and `mode=final` runs the final sync.
+`--reset-then-reuse-values` keeps your values but takes the defaults of a newer chart version. The Job is a plain
+resource, not a Helm hook: Helm waits for hook Jobs to finish, and a backfill that takes days would run into the
+upgrade timeout and fail the release. `helm upgrade --wait --wait-for-jobs` waits for a run when you want that, for
+example for the final sync. With Flux, set `disableWaitForJobs` on the HelmRelease's install and upgrade, and change
+a value (for example a pod annotation) to start a new run, since Flux upgrades only when something changed. Tools that
+only render the chart with `helm template`, such as Argo CD, always render revision 1, so the Job name doesn't change
+and they can't start a new run.
+[values.yaml](charts/vmrebalance/values.yaml) lists all settings; [docs/usage.md](docs/usage.md) walks through a
+migration with the chart.
 
 ## Usage
 
@@ -173,10 +201,8 @@ and lists all flags. `vmrebalance <command> --help` shows them too.
 ### Where to run it
 
 `sync` runs [vmctl](https://docs.victoriametrics.com/victoriametrics/vmctl/) once per chunk. vmctl needs network
-access to blue's vmselect and green's vminsert, so run `sync` as a Job in the cluster:
-[deploy/rbac.yaml](deploy/rbac.yaml) holds the permissions, [deploy/job.yaml](deploy/job.yaml) is an example sync
-Job and [deploy/job-final.yaml](deploy/job-final.yaml) one for the final sync.
-No image is published yet, so build one from the [Dockerfile](Dockerfile), which bundles vmctl.
+access to blue's vmselect and green's vminsert, so run `sync` as a Job in the cluster with the
+[Helm chart](#helm-chart). Its Job uses the [container image](#container-image), which bundles vmctl.
 
 From a workstation, port-forward both Services and pass `--from-select-url http://localhost:8481` and
 `--to-insert-url http://localhost:8480`, with `vmctl` in your `PATH`. `preflight`, `verify` and `status` work
@@ -203,12 +229,12 @@ from a workstation without port-forwarding.
   the range are compared, because the day's series count also includes series outside it.
 - `sync --final`: before copying, blue's vminsert receives no rows during one `--drain-interval` within
   `--drain-timeout`, and has delivered every row it accepted (nothing buffered for vmstorage, no rows sent and no
-  failed sends during the window, every vmstorage node reachable); otherwise some writer still points at blue or rows are
-  still on their way (a window in which a vminsert pod restarted counts as unknown and is measured again). After
-  copying, it waits 30 seconds until green has made the rows searchable, then resets the rollup cache on every green
-  vmselect pod, so no pod serves results cached before the backfill, and runs `verify` for the days the final sync
-  copied, failing on partial responses. It also fails while any day stored in the state failed verify and hasn't
-  passed since.
+  failed sends during the window, every vmstorage node reachable); otherwise some writer still points at blue or
+  rows are still on their way (a window in which a vminsert pod restarted counts as unknown and is measured again).
+  After copying, it waits 30 seconds until green has made the rows searchable, then resets the rollup cache on every
+  green vmselect pod, so no pod serves results cached before the backfill, and runs `verify` for the days the final
+  sync copied, failing on partial responses. It also fails while any day stored in the state failed verify and
+  hasn't passed since.
 
 ## Risks
 
@@ -227,17 +253,24 @@ from a workstation without port-forwarding.
 
 ```sh
 make check
+make chart
 make e2e
 ```
 
-`make check` runs `go vet`, the unit tests with the race detector, and golangci-lint (if installed). `make e2e`
-creates a kind cluster with its own kubeconfig (your current context stays untouched), installs the operator, two
-small VMClusters and a VMAgent writing to both, and runs a full migration. It needs docker, kind, kubectl and helm.
-Set `KEEP_CLUSTER=1` to keep the cluster for another run. Pull requests run both.
+`make check` runs `go vet`, the unit tests with the race detector, and golangci-lint (if installed). `make chart`
+lints the Helm chart with each of its `ci/*-values.yaml` files and validates the manifests with kubeconform (if
+installed). `make e2e` creates a kind cluster with its own kubeconfig (your current context stays untouched),
+installs the operator, two small VMClusters and a VMAgent writing to both, and runs a full migration, with the sync
+Jobs installed from the chart. It needs docker, kind, kubectl and helm. Set `KEEP_CLUSTER=1` to keep the cluster for
+another run. Pull requests run the checks and the end-to-end test; when they change the chart, they also run
+chart-testing (`ct lint`, which also checks that the chart version was bumped) and kubeconform.
 
 ### Releasing
 
 Every push to `main` updates a draft release (Release Drafter, notes grouped by pull request label;
 `skip-changelog` hides a pull request). Publishing the draft creates the `vX.Y.Z` tag, which runs `make check` and
 builds the binaries for Linux and macOS (amd64, arm64) with GoReleaser and attaches them with a checksum file.
-`vmrebalance --version` prints the release version.
+`vmrebalance --version` prints the release version. Every push to `main` and every tag also publishes the
+[container image](#container-image). A chart change on `main` publishes the chart to
+`oci://ghcr.io/kokuwaio/charts/vmrebalance` (OCI only, no classic Helm repository); bump the chart `version` with
+every chart change, and `appVersion` when the chart should run a new release.

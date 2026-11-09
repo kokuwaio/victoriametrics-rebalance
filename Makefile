@@ -38,6 +38,17 @@ lint: ## Run golangci-lint (skipped if not installed)
 .PHONY: check
 check: vet test lint ## Pre-PR check: vet, test, lint
 
+.PHONY: chart
+chart: ## Lint the Helm chart with each ci/*-values.yaml and validate the manifests (kubeconform if installed)
+	@for values in charts/vmrebalance/ci/*-values.yaml; do \
+	  echo "==> $$values"; \
+	  helm lint charts/vmrebalance --values "$$values" || exit 1; \
+	  if command -v kubeconform >/dev/null 2>&1; then \
+	    helm template vmrebalance charts/vmrebalance --namespace monitoring --values "$$values" \
+	      | kubeconform -strict -summary -ignore-missing-schemas || exit 1; \
+	  fi; \
+	done
+
 .PHONY: image
 image: ## Build the container image vmrebalance:<version>
 	docker build --build-arg VERSION=$(VERSION) -t $(BINARY):$(VERSION) .

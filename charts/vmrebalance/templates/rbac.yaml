@@ -1,15 +1,10 @@
-# Permissions for running vmrebalance as a Job in the namespace of both VMClusters.
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: vmrebalance
-  namespace: monitoring
----
+{{- if .Values.rbac.create -}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: vmrebalance
-  namespace: monitoring
+  name: {{ include "vmrebalance.fullname" . }}
+  labels:
+    {{- include "vmrebalance.labels" . | nindent 4 }}
 rules:
   # Read both VMClusters.
   - apiGroups: [operator.victoriametrics.com]
@@ -22,7 +17,7 @@ rules:
   - apiGroups: [policy]
     resources: [poddisruptionbudgets]
     verbs: [list]
-  # Only needed with --access=proxy (the default outside a pod): reach vmselect and pods through the API server.
+  # Only needed with --access=proxy: reach vmselect and pods through the API server.
   - apiGroups: [""]
     resources: [pods/proxy, services/proxy]
     verbs: [get]
@@ -34,13 +29,15 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: vmrebalance
-  namespace: monitoring
+  name: {{ include "vmrebalance.fullname" . }}
+  labels:
+    {{- include "vmrebalance.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: vmrebalance
+  name: {{ include "vmrebalance.fullname" . }}
 subjects:
   - kind: ServiceAccount
-    name: vmrebalance
-    namespace: monitoring
+    name: {{ include "vmrebalance.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

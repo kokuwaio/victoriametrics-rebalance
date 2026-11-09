@@ -22,20 +22,15 @@ cutover take minutes. Plan a few days of soak time before you delete blue.
 
 ## Install
 
-`sync` runs vmctl, which needs network access to blue's vmselect and green's vminsert, so it usually runs as a Job
-in the cluster. No image is published yet. Build one from the [Dockerfile](../Dockerfile), which bundles vmctl, and
-push it to a registry your cluster can pull from:
-
-```sh
-make image
-docker tag "vmrebalance:$(git describe --tags --always --dirty)" registry.example.com/vmrebalance:dev
-docker push registry.example.com/vmrebalance:dev
-```
+`sync` runs vmctl, which needs network access to blue's vmselect and green's vminsert, so it runs as a Job in the
+cluster, installed with the [Helm chart](../README.md#helm-chart). The Job uses the image
+`ghcr.io/kokuwaio/victoriametrics-rebalance`, which bundles vmctl. The cluster needs an image pull secret for
+`ghcr.io` (the chart value `imagePullSecrets`) until the package is made public.
 
 For `preflight`, `verify` and `status` from a workstation, install the binary with mise or build it, see
-[Install](../README.md#install). It uses your kubeconfig (`--kubeconfig`, `--context`), and needs read access to the VMClusters, pods and
-PodDisruptionBudgets, and write access to ConfigMaps in the namespace. [deploy/rbac.yaml](../deploy/rbac.yaml)
-lists the exact permissions.
+[Install](../README.md#install). It uses your kubeconfig (`--kubeconfig`, `--context`), and needs read access to
+the VMClusters, pods and PodDisruptionBudgets, and write access to ConfigMaps in the namespace. The chart's
+[Role](../charts/vmrebalance/templates/rbac.yaml) lists the exact permissions.
 
 ## Step 1: Put aliases in front of vmselect and vminsert
 
@@ -168,17 +163,18 @@ through the final sync. See [Troubleshooting](#troubleshooting) for what each fa
 
 ## Step 5: Copy the past with `sync` (backfill)
 
-Apply the permissions once, then the sync Job:
+Install the [Helm chart](../README.md#helm-chart). It creates a ServiceAccount, a Role and the first sync Job:
 
 ```sh
-kubectl apply -f deploy/rbac.yaml
-kubectl apply -f deploy/job.yaml
-kubectl -n monitoring logs -f job/vmrebalance-sync
+helm install vmrebalance oci://ghcr.io/kokuwaio/charts/vmrebalance -n monitoring --set from=vmcluster --set to=vmcluster-b
+kubectl -n monitoring logs -f job/vmrebalance-sync-1
 ```
 
-Edit [deploy/job.yaml](../deploy/job.yaml) first: the image, `--from`, `--to`, and the rate settings. The first run
-copies from `now - retention` up to now, one chunk at a time. Every finished chunk is saved in the state, so if the
-pod is evicted or restarted, the next one continues with the first unfinished chunk.
+The Job is named `<release>-<mode>-<revision>`; `helm install` and `helm upgrade` print the name. Set the rate
+settings below through the chart's [values](../charts/vmrebalance/values.yaml) (`copy.rateLimit`, `sync.adaptive`,
+`copy.step`, `copy.concurrency`), with `--set` or a values file. The chart defaults to `50MiB/s`, `--adaptive` and
+1h chunks. The first run copies from `now - retention` up to now, one chunk at a time. Every finished chunk is saved
+in the state, so if the pod is evicted or restarted, the next one continues with the first unfinished chunk.
 
 How to choose the settings:
 
@@ -196,8 +192,8 @@ How to choose the settings:
 
 A failed chunk is retried `--retries` times (default 3), with a wait that starts at `--backoff` (default 1m) and
 doubles. When a chunk still fails, the pod exits with an error, and the Job restarts it (up to its `backoffLimit`),
-which continues with the failed chunk. If the Job gives up, fix the cause, then delete the Job and apply it again; it
-continues where it stopped.
+which continues with the failed chunk. If the Job gives up, fix the cause, then start a new run with `helm upgrade`
+(see step 7); it continues where it stopped.
 
 ### Watching the progress
 
@@ -222,8 +218,8 @@ Final sync:       -
 
 The ETA accounts for time moving on while the copy runs. If it says the copy won't catch up, raise the rate limit.
 
-With `--metrics-addr :8080` (set in the example Job), the tool serves Prometheus metrics. Scrape them with a
-VMPodScrape for the label `app.kubernetes.io/name: vmrebalance` and port `http-metrics`. Useful queries:
+The chart's Job serves Prometheus metrics on port `http-metrics` (`--metrics-addr`). Set
+`metrics.podScrape.enabled=true` to let the chart create a VMPodScrape for them. Useful queries:
 
 | What | Query |
 |---|---|
@@ -257,9 +253,17 @@ then run it inside the cluster, where it connects directly (see [Access modes](#
 
 ## Step 7: Catch up
 
-Run the sync Job again, as often as needed: delete it and apply it again. Each run copies from the last synced point
-to now. When a run takes only a few minutes, the copy has caught up, and you are ready for the cutover. Keep the time
-between the last catch-up and the cutover short: data from writers that bypass VMAgent waits for the final sync.
+Start a new sync run as often as needed. Every upgrade starts a new Job and removes the previous one, also while it
+still runs, so wait until the last run has finished (`kubectl -n monitoring wait --for=condition=Complete
+--timeout=-1s job/<name>`):
+
+```sh
+helm upgrade vmrebalance oci://ghcr.io/kokuwaio/charts/vmrebalance -n monitoring --reset-then-reuse-values
+```
+
+Each run copies from the last synced point to now. When a run takes only a few minutes, the copy has caught up, and
+you are ready for the cutover. Keep the time between the last catch-up and the cutover short: data from writers that
+bypass VMAgent waits for the final sync.
 
 ## Step 8: Cut over
 
@@ -273,13 +277,17 @@ Note the time the change took effect, in UTC: this is the cutover time.
 
 ## Step 9: Run the final sync
 
-Edit `--cutover-at` in [deploy/job-final.yaml](../deploy/job-final.yaml) to the cutover time, then apply it right
-after the cutover:
+Switch the release to the final mode with the cutover time, right after the cutover. Wait until the last catch-up
+run has finished first, because the upgrade deletes its Job:
 
 ```sh
-kubectl apply -f deploy/job-final.yaml
-kubectl -n monitoring logs -f job/vmrebalance-final
+helm upgrade vmrebalance oci://ghcr.io/kokuwaio/charts/vmrebalance -n monitoring --reset-then-reuse-values --set mode=final --set-string final.cutoverAt=2026-01-09T10:00:00Z
+kubectl -n monitoring logs -f job/vmrebalance-final-3
 ```
+
+`vmrebalance-final-3` is an example: the revision in the name is the one `helm upgrade` prints.
+
+The chart values `final.drainInterval`, `final.drainTimeout`, `final.overlap` and `verify.*` set the options below.
 
 The final sync:
 
@@ -301,8 +309,8 @@ PASS  earlier verify      no failed days stored
 Done. Keep blue for a few days so you can roll back, then delete it and its PVCs.
 ```
 
-The Job doesn't restart on failure, because a failed check needs a person to look. Fix the cause, then delete the
-Job and apply it again with the same `--cutover-at`: a rerun covers at least the first run's window again.
+The Job doesn't restart on failure, because a failed check needs a person to look. Fix the cause, then run the same
+`helm upgrade` again with the same `final.cutoverAt`: a rerun covers at least the first run's window again.
 
 Set `--drain-interval` longer than the push interval of your slowest writer (and at least 1m): blue passes only when
 it receives no rows at all during one whole interval. Set `--final-overlap` longer if a writer that bypasses VMAgent
@@ -314,7 +322,8 @@ Keep blue for a few days, so you can roll back. Then:
 
 - Delete the blue VMCluster. The vmstorage PVCs usually stay after their StatefulSet is gone: list them with
   `kubectl -n monitoring get pvc` and delete blue's (named like `vmstorage-db-vmstorage-vmcluster-0`).
-- Delete the state ConfigMap, the Jobs and, if you don't need them any more, the RBAC objects.
+- Uninstall the chart (`helm uninstall vmrebalance -n monitoring`), which removes the Job, Role and ServiceAccount, and
+  delete the state ConfigMap, which the chart doesn't own.
 - Check dashboards, alerts and SLOs that name blue (for example `job="vmstorage-vmcluster"`).
 
 ## Rolling back
@@ -328,7 +337,12 @@ vmrebalance sync -n monitoring --from vmcluster-b --to vmcluster --since 2026-01
 ```
 
 Without `--since`, the reverse run starts with an empty state and copies green's whole retention. The reverse
-direction has its own state, so the forward migration's state stays as it was.
+direction has its own state, so the forward migration's state stays as it was. With the chart, install a second
+release for the reverse direction:
+
+```sh
+helm install vmrebalance-back oci://ghcr.io/kokuwaio/charts/vmrebalance -n monitoring --set from=vmcluster-b --set to=vmcluster --set-string sync.since=2026-01-09T10:00:00Z
+```
 
 ## Running from a workstation
 
@@ -450,8 +464,8 @@ The commands print a reason with every failure. The most common ones:
 | `VMCluster ... was deleted and created again` | The saved progress belongs to a cluster that no longer exists. | Delete the state to start over. |
 | `cutover ... is in the future` | `--cutover-at` is later than now. | Run the final sync after the cutover, with the time it took effect. |
 | `blue still received N rows/s ... point it at green` | Some writer still sends to blue. Its data would be lost with blue. | Find it (blue's vminsert metric `vm_rows_inserted_total` shows the protocol), point it at the alias, rerun with the same `--cutover-at`. |
-| `vminsert pods restarted or changed during every measurement` | The drain check couldn't measure. | Wait until blue's vminsert pods are stable, then rerun. |
+| `vminsert pods restarted, changed or were terminating during every measurement` | The drain check couldn't measure: a pod restarted, or is shutting down and may still send rows. | Wait until blue's vminsert pods are stable, then rerun. A pod stuck terminating (e.g. on a lost node) blocks the check until it is deleted. |
 | `still fail to send to a vmstorage node` or `were still delivering rows` | Blue's vminsert still holds rows it accepted. | Fix blue's vmstorage nodes, then rerun. |
 | `verify` fails with `series: ...` or `samples of ...` | Green has less than blue for that day. | Run `verify` for the day again later. If it still fails, copy the day again: a `sync` with its own `--state-file`, `--since` and `--until`. |
-| `earlier verify` fails | A day failed verify earlier and hasn't passed a whole-day verify since. | `verify --since <day> --until <next day>`, then rerun the final sync. |
+| `earlier verify` fails | A day failed verify earlier, and no later verify of that time range passed. | `verify --since <day> --until <next day>`, then rerun the final sync. |
 | `verify` times out | The API server cut the request off (`--access=proxy`). | Run it inside the cluster, where it connects directly. |

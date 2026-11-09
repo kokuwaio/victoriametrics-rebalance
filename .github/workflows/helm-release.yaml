@@ -1,0 +1,55 @@
+# Publishes the chart to oci://ghcr.io/<owner>/charts when a chart change reaches main. OCI only: no GitHub release
+# and no classic Helm repository (index.yaml, gh-pages).
+name: helm-release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'charts/**'
+
+permissions:
+  contents: read
+
+env:
+  HELM_VERSION: v4.3.1
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Lint
+        run: |
+          for values in charts/vmrebalance/ci/*-values.yaml; do
+            helm lint charts/vmrebalance --values "$values"
+          done
+
+      # Only install cr: the full action would also create a GitHub release and update an index branch.
+      - name: Install chart-releaser
+        uses: helm/chart-releaser-action@v1.9.0
+        with:
+          install_only: true
+          version: v1.10.1
+
+      # --skip-existing never overwrites a published chart version.
+      - name: Push the chart to GHCR
+        env:
+          CR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cr package charts/vmrebalance
+          cr push \
+            --registry-url "oci://ghcr.io/${GITHUB_REPOSITORY_OWNER}/charts" \
+            --username "$GITHUB_ACTOR" \
+            --skip-existing

@@ -6,7 +6,7 @@
 |---|---|---|
 | 1 | **Manual run-through.** Run the steps by hand on a test cluster with `vmctl`, and measure GB/h copied, the CPU and I/O load on blue's vmstorage and vmselect, disk growth on green, and the gap the final sync has to close. This sets the default chunk size, concurrency and rate limit, and shows whether the approach is fast enough at all. | open |
 | 2 | **MVP CLI.** `preflight`, `sync` with the vmctl engine, state in a ConfigMap (or a local file), `status`. Unit tests with fakes, and an end-to-end test on kind with two small VMClusters. | done |
-| 3 | **Verify and final sync.** `verify`, `sync --final` (rollup cache reset, blue drain check, verify), Job manifests and a container image. | done; no image is published yet |
+| 3 | **Verify and final sync.** `verify`, `sync --final` (rollup cache reset, blue drain check, verify), the Helm chart and a container image. | done |
 | 4 | **Hardening.** Retries with backoff per chunk, a rate limit that adapts to blue's load (`--adaptive`), and Prometheus metrics for the tool (`--metrics-addr`). | done |
 | 5 | **Optional.** An `--apply` mode for setups without GitOps (patch the VMAgent `remoteWrite` and the alias Services directly), a copy engine written in Go, and a proposal to the operator project once this has run in production. | open |
 

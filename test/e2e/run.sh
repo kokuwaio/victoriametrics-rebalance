@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs the end-to-end test on a local kind cluster: two small VMClusters, a VMAgent writing to both, and
-# vmrebalance running locally (preflight, verify, status) and as a Job (sync, sync --final).
+# vmrebalance running locally (preflight, verify, status) and as a Job from the Helm chart (sync, sync --final).
 #
 # Needs docker, kind, helm, kubectl and go. The cluster gets its own kubeconfig file, so your current context
 # stays untouched. Set KEEP_CLUSTER=1 to keep the cluster afterwards (the next run reuses it).
@@ -31,7 +31,6 @@ kind load docker-image vmrebalance:e2e --name "$name"
 go build -o "${work}/vmrebalance" ./cmd/vmrebalance
 
 kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f deploy/rbac.yaml
 kubectl apply -f test/e2e/manifests.yaml
 for c in blue green; do
   kubectl -n monitoring wait "vmcluster/${c}" --for=jsonpath='{.status.updateStatus}'=operational --timeout=5m

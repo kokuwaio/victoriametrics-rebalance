@@ -6,6 +6,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -20,7 +21,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/utils/ptr"
 
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/vm"
 )
@@ -59,10 +59,9 @@ func TestMigration(t *testing.T) {
 		}
 	})
 
-	t.Run("sync as a Job", func(t *testing.T) {
+	t.Run("sync as a Job from the chart", func(t *testing.T) {
 		e := e.on(t)
-		e.runJob("vmrebalance-sync", "sync", "--from=blue", "--to=green", "--retries=1", "--backoff=5s",
-			"--step=12h", "--adaptive", "--rate-limit=10MiB/s", "--metrics-addr=:8080")
+		e.runJob("sync", "copy.retries=1", "copy.backoff=5s", "copy.step=12h", "copy.rateLimit=10MiB/s")
 		if !strings.Contains(e.jobLogs, "serving metrics") {
 			t.Error("the sync Job didn't start its metrics server")
 		}
@@ -98,8 +97,8 @@ func TestMigration(t *testing.T) {
 		}
 		// A cutover 15 minutes ago lets the final sync start right away.
 		cutover := time.Now().Add(-15 * time.Minute).UTC().Format(time.RFC3339)
-		e.runJob("vmrebalance-final", "sync", "--final", "--from=blue", "--to=green", "--cutover-at="+cutover,
-			"--drain-interval=1m", "--drain-timeout=5m", "--top-n=5", "--random-n=5")
+		e.runJob("final", "final.cutoverAt="+cutover, "final.drainInterval=1m", "final.drainTimeout=5m",
+			"verify.topN=5", "verify.randomN=5")
 	})
 
 	t.Run("status", func(t *testing.T) {
@@ -173,36 +172,36 @@ func (e *e2e) storageRows(pod string) float64 {
 	})
 }
 
-// runJob runs vmrebalance as a Job with the given arguments and fails the test unless it succeeds.
-func (e *e2e) runJob(name string, args ...string) {
+const (
+	release = "vmrebalance"
+	// chart is relative to this package's directory, where go test runs.
+	chart = "../../charts/vmrebalance"
+)
+
+// runJob installs or upgrades the chart's release in the given mode with the given values (key=value, set as
+// strings), waits for the Job of the new revision and fails the test unless it succeeds.
+func (e *e2e) runJob(mode string, values ...string) {
+	args := []string{"upgrade", "--install", release, chart, "--namespace", ns,
+		"--set", "image.repository=vmrebalance", "--set", "image.tag=e2e", "--set", "image.pullPolicy=Never",
+		"--set", "from=blue", "--set", "to=green", "--set", "mode=" + mode, "--set", "job.backoffLimit=0"}
+	for _, v := range values {
+		args = append(args, "--set-string", v)
+	}
+	if out, err := exec.CommandContext(e.ctx, "helm", args...).CombinedOutput(); err != nil {
+		e.t.Fatalf("helm upgrade: %v\n%s", err, out)
+	}
+	out, err := exec.CommandContext(e.ctx, "helm", "status", release, "--namespace", ns, "--output", "json").Output()
+	if err != nil {
+		e.t.Fatalf("helm status: %v", err)
+	}
+	var status struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(out, &status); err != nil {
+		e.t.Fatalf("decode helm status: %v", err)
+	}
+	name := fmt.Sprintf("%s-%s-%d", release, mode, status.Version)
 	jobs := e.cs.BatchV1().Jobs(ns)
-	_ = jobs.Delete(e.ctx, name, metav1.DeleteOptions{PropagationPolicy: ptr.To(metav1.DeletePropagationForeground)})
-	e.eventually("old Job "+name+" is gone", time.Minute, func() bool {
-		_, err := jobs.Get(e.ctx, name, metav1.GetOptions{})
-		return err != nil
-	})
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-		Spec: batchv1.JobSpec{
-			BackoffLimit: ptr.To[int32](0),
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"job-name": name}},
-				Spec: corev1.PodSpec{
-					ServiceAccountName: "vmrebalance",
-					RestartPolicy:      corev1.RestartPolicyNever,
-					Containers: []corev1.Container{{
-						Name:            "vmrebalance",
-						Image:           "vmrebalance:e2e",
-						ImagePullPolicy: corev1.PullNever,
-						Args:            args,
-					}},
-				},
-			},
-		},
-	}
-	if _, err := jobs.Create(e.ctx, job, metav1.CreateOptions{}); err != nil {
-		e.t.Fatal(err)
-	}
 	var done *batchv1.Job
 	e.eventually("Job "+name+" finishes", 15*time.Minute, func() bool {
 		j, err := jobs.Get(e.ctx, name, metav1.GetOptions{})
