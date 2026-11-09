@@ -34,6 +34,8 @@ var operatorKind = map[Component]vmv1beta1.ClusterComponent{
 type Info struct {
 	Name      string
 	Namespace string
+	// UID is the VMCluster's metadata.uid. It changes when the VMCluster is deleted and created again.
+	UID string
 	// Status is the operator's updateStatus; Operational is true when it is "operational".
 	Status      string
 	Operational bool
@@ -54,6 +56,7 @@ func FromVMCluster(cr *vmv1beta1.VMCluster) Info {
 	info := Info{
 		Name:              cr.Name,
 		Namespace:         cr.Namespace,
+		UID:               string(cr.UID),
 		Status:            string(cr.Status.UpdateStatus),
 		Operational:       cr.Status.UpdateStatus == vmv1beta1.UpdateStatusOperational,
 		Retention:         cr.Spec.RetentionPeriod,

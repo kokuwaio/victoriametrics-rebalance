@@ -113,9 +113,9 @@ func TestConfigMapStoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertRoundTrip(t, got)
-	cm, err := cs.CoreV1().ConfigMaps("monitoring").Get(t.Context(), "vmrebalance-blue-green", metav1.GetOptions{})
+	cm, err := cs.CoreV1().ConfigMaps("monitoring").Get(t.Context(), "vmrebalance.blue.green", metav1.GetOptions{})
 	if err != nil {
-		t.Fatalf("ConfigMap vmrebalance-blue-green: %v", err)
+		t.Fatalf("ConfigMap vmrebalance.blue.green: %v", err)
 	}
 	if cm.Labels["app.kubernetes.io/managed-by"] != "vmrebalance" {
 		t.Errorf("labels = %v", cm.Labels)
@@ -178,10 +178,10 @@ func TestEachTenantHasItsOwnState(t *testing.T) {
 	if err != nil || !got.SyncedUntil.IsZero() {
 		t.Errorf("tenant 1:2 loaded %+v, %v; want an empty state, not tenant 0's progress", got, err)
 	}
-	if name := state.Name(other); name != "vmrebalance-blue-green-1-2" {
+	if name := state.Name(other); name != "vmrebalance.blue.green.tenant-1-2" {
 		t.Errorf("name = %s", name)
 	}
-	for tenant, want := range map[string]string{"0:0": "vmrebalance-blue-green", "": "vmrebalance-blue-green", "1:0": "vmrebalance-blue-green-1"} {
+	for tenant, want := range map[string]string{"0:0": "vmrebalance.blue.green", "": "vmrebalance.blue.green", "1:0": "vmrebalance.blue.green.tenant-1"} {
 		if name := state.Name(state.Migration{From: "blue", To: "green", Tenant: tenant}); name != want {
 			t.Errorf("tenant %q: name = %s, want %s (the same tenant as its short form)", tenant, name, want)
 		}
@@ -208,5 +208,32 @@ func TestAPartialPassDoesNotHideAFullDayResult(t *testing.T) {
 	s.SetVerification(synced, state.DayResult{Pass: true})
 	if got := s.Verifications[state.DayKey(synced)]; !got.Pass {
 		t.Errorf("a new whole-day pass must replace the failure: %+v", got)
+	}
+}
+
+func TestBindClustersRejectsARecreatedVMCluster(t *testing.T) {
+	st := &state.Memory{}
+	_, _ = st.Update(t.Context(), func(s *state.State) { s.From, s.To, s.SyncedUntil = "blue", "green", synced })
+
+	if err := state.BindClusters(t.Context(), st, "uid-blue", "uid-green"); err != nil {
+		t.Fatalf("first use: %v", err)
+	}
+	if err := state.BindClusters(t.Context(), st, "uid-blue", "uid-green"); err != nil {
+		t.Errorf("same clusters: %v", err)
+	}
+
+	err := state.BindClusters(t.Context(), st, "uid-blue", "uid-green-2")
+	if err == nil || !strings.Contains(err.Error(), "green was deleted and created again") {
+		t.Errorf("err = %v, want a refusal to reuse green's old progress", err)
+	}
+}
+
+func TestStateNamesDontCollide(t *testing.T) {
+	a := state.Name(state.Migration{From: "blue", To: "green-1"})
+	b := state.Name(state.Migration{From: "blue", To: "green", Tenant: "1"})
+	c := state.Name(state.Migration{From: "blue-green", To: "x"})
+	d := state.Name(state.Migration{From: "blue", To: "green-x"})
+	if a == b || c == d {
+		t.Errorf("names collide: %s / %s, %s / %s", a, b, c, d)
 	}
 }

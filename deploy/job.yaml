@@ -1,6 +1,6 @@
 # One sync run (backfill or catch-up). Recreate the Job for every run: delete it, then apply it again.
 #
-# The state lives in the ConfigMap vmrebalance-<from>-<to>, so a pod that is evicted or restarted continues with
+# The state lives in the ConfigMap vmrebalance.<from>.<to>, so a pod that is evicted or restarted continues with
 # the first unfinished chunk.
 #
 # Inside the cluster the tool connects to the Services and pods directly (--access=auto picks direct). If

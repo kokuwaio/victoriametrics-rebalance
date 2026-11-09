@@ -52,7 +52,7 @@ flowchart LR
 
     subgraph k8s["Kubernetes cluster"]
         api["API server"]
-        cm[("ConfigMap<br/>vmrebalance-&lt;from&gt;-&lt;to&gt;")]
+        cm[("ConfigMap<br/>vmrebalance.&lt;from&gt;.&lt;to&gt;")]
         agent["VMAgent"]
 
         subgraph blue["blue VMCluster (old)"]
@@ -184,31 +184,36 @@ blind rerun.
 ```mermaid
 flowchart TD
     start(["sync --final --cutover-at Tcut"]) --> wait["wait until Tcut + 15m"]
-    wait --> drain{"does blue's vminsert accept<br/>no rows for one --drain-interval<br/>within --drain-timeout?"}
+    wait --> drain{"does blue's vminsert accept<br/>no rows for one --drain-interval<br/>and hold none for vmstorage,<br/>within --drain-timeout?"}
     drain -- "no" --> fail(["FAIL: nothing copied,<br/>a writer still points at blue"])
     drain -- "unknown: pods restarted<br/>in every interval" --> unknown(["FAIL: nothing copied,<br/>rerun once pods are stable"])
     drain -- "yes, at Tdrained" --> copy["copy [min(SyncedUntil, Tcut) - overlap, Tdrained]<br/>(overlap is safe: green deduplicates)"]
-    copy --> reset["reset the rollup result cache<br/>on every green vmselect pod"]
+    copy --> settle["wait 30s until green<br/>can search the imported rows"]
+    settle --> reset["reset the rollup result cache<br/>on every green vmselect pod"]
     reset --> verify["verify the days the final sync copied<br/>(partial responses fail)"]
-    verify --> ok(["Done: keep blue for rollback, then delete it"])
+    verify --> earlier{"any stored day that failed<br/>verify and hasn't passed since?"}
+    earlier -- "yes" --> again(["FAIL: verify those days first"])
+    earlier -- "no" --> ok(["Done: keep blue for rollback, then delete it"])
 ```
 
 ## State
 
 The state is one JSON document per migration and tenant. By default it lives in the ConfigMap
-`vmrebalance-<from>-<to>` (with `-<tenant>` appended for tenants other than 0) in the namespace of both clusters,
+`vmrebalance.<from>.<to>` (with `.tenant-<tenant>` appended for tenants other than 0) in the namespace of both clusters,
 which survives restarts of a Job's pod. With `--state-file` it lives in a local file instead. A state saved for
-another pair of clusters or another tenant is refused.
+another pair of clusters or another tenant is refused, and so is one saved for a VMCluster that was deleted and
+created again under the same name (the state records both UIDs).
 
 | Field | Written by | Meaning |
 |---|---|---|
 | `from`, `to`, `tenant` | every command | Which migration the state belongs to. A state for another one is refused. |
+| `fromUID`, `toUID` | every command that opens the clusters | The VMClusters' UIDs, recorded on first use. A VMCluster that was deleted and created again is refused. |
 | `dualWriteSeenAt` | `preflight` | When green was first seen receiving live writes (T0, or a little after it). |
 | `backfillStart` | `sync` | Where the first sync started. |
 | `syncedUntil` | `sync` | End of the last finished chunk. The next sync continues here. |
 | `chunks` | `sync` | History of finished chunks (window, bytes, seconds), capped at the last 500. Only `status` reads it. |
 | `verifications` | `verify`, `sync --final` | The latest result per UTC day. |
-| `cutoverAt`, `finalStart`, `finalEnd`, `finalSyncAt` | `sync --final` | The cutover time and the window the final sync copied. |
+| `cutoverAt`, `finalStart`, `finalEnd`, `finalSyncAt` | `sync --final` | The cutover time and the window the final sync copied. A rerun clears `finalSyncAt` until its copy finishes. |
 
 Several commands can run at once, for example `verify` from a workstation during a sync Job. So no command writes
 back a state it loaded earlier. Each one calls `Store.Update` with a function that changes only its own fields.

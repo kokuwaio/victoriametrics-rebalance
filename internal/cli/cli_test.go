@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -105,5 +106,25 @@ func TestVerifyFlagsRejectNegativeCountsAndBadTolerance(t *testing.T) {
 		if err := v.validate(); err == nil {
 			t.Errorf("%s: want an error", name)
 		}
+	}
+}
+
+func TestEarlierFailuresBlockTheFinalSync(t *testing.T) {
+	st := &state.State{BackfillStart: ts("2026-01-02T10:00:00Z"), SyncedUntil: ts("2026-01-06T12:00:00Z"), Verifications: map[string]state.DayResult{
+		"2026-01-02": {Pass: false}, // the partly copied backfill-start day
+		"2026-01-03": {Pass: false},
+		"2026-01-04": {Pass: true},
+		"2026-01-05": {Pass: false},
+	}}
+	thisRun := []check.Result{{Name: "verify 2026-01-05", Level: check.Fail}}
+
+	r := earlierFailures(st, thisRun)
+
+	if r.Level != check.Fail || !strings.Contains(r.Message, "2026-01-03") || strings.Contains(r.Message, "2026-01-05") ||
+		strings.Contains(r.Message, "2026-01-02") {
+		t.Errorf("earlier verify = %s %q, want only the failed day in the migrated range outside this run", r.Level, r.Message)
+	}
+	if r := earlierFailures(&state.State{}, nil); r.Level != check.Pass {
+		t.Errorf("without stored failures: %s %q", r.Level, r.Message)
 	}
 }

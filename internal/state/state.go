@@ -4,6 +4,7 @@ package state
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"sync"
 	"time"
@@ -19,6 +20,10 @@ type State struct {
 	To   string `json:"to"`
 	// Tenant is the tenant the migration copies. Empty means tenant 0.
 	Tenant string `json:"tenant,omitempty"`
+	// FromUID and ToUID are the VMClusters' UIDs, recorded on first use, so a VMCluster that was deleted and
+	// created again under the same name isn't taken for the one the progress belongs to.
+	FromUID string `json:"fromUID,omitempty"`
+	ToUID   string `json:"toUID,omitempty"`
 
 	// DualWriteSeenAt is when preflight first saw green receive live writes (T0, or a little after it).
 	DualWriteSeenAt time.Time `json:"dualWriteSeenAt,omitzero"`
@@ -111,4 +116,27 @@ func (s *State) clone() *State {
 	c.Chunks = append([]Chunk(nil), s.Chunks...)
 	c.Verifications = maps.Clone(s.Verifications)
 	return &c
+}
+
+// BindClusters records the VMClusters' UIDs on first use and fails when either changed since: a VMCluster that was
+// deleted and created again under the same name starts empty, so the saved progress doesn't apply to it.
+func BindClusters(ctx context.Context, store Store, fromUID, toUID string) error {
+	if fromUID == "" || toUID == "" {
+		return fmt.Errorf("VMCluster UID unknown (from %q, to %q)", fromUID, toUID)
+	}
+	st, err := store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	for _, c := range []struct{ name, saved, now string }{{st.From, st.FromUID, fromUID}, {st.To, st.ToUID, toUID}} {
+		if c.saved != "" && c.saved != c.now {
+			return fmt.Errorf("VMCluster %s was deleted and created again since the state was saved (UID %s, now %s): "+
+				"its progress no longer applies; delete the state to start over", c.name, c.saved, c.now)
+		}
+	}
+	if st.FromUID == fromUID && st.ToUID == toUID {
+		return nil
+	}
+	_, err = store.Update(ctx, func(st *State) { st.FromUID, st.ToUID = fromUID, toUID })
+	return err
 }

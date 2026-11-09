@@ -83,6 +83,16 @@ day's series count also includes series written afterwards.`,
 	return cmd
 }
 
+// firstFullDay is the first UTC day the backfill copied completely: the day it started on is only partly copied,
+// unless it started at midnight.
+func firstFullDay(st *state.State) time.Time {
+	from := st.BackfillStart.UTC().Truncate(day)
+	if !from.Equal(st.BackfillStart) {
+		from = from.Add(day)
+	}
+	return from
+}
+
 func verifyRange(since, until string, st *state.State) (time.Time, time.Time, error) {
 	var from, to time.Time
 	var err error
@@ -95,11 +105,7 @@ func verifyRange(since, until string, st *state.State) (time.Time, time.Time, er
 		if st.BackfillStart.IsZero() {
 			return from, to, errors.New("nothing synced yet: pass --since and --until, or run sync first")
 		}
-		// The day the backfill started on is only partly copied, so start with the next one.
-		from = st.BackfillStart.UTC().Truncate(day)
-		if !from.Equal(st.BackfillStart) {
-			from = from.Add(day)
-		}
+		from = firstFullDay(st)
 	}
 	if until != "" {
 		if to, err = parseTime("--until", until, now); err != nil {

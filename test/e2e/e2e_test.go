@@ -45,7 +45,7 @@ func TestMigration(t *testing.T) {
 	if e.bin == "" {
 		t.Fatal("VMREBALANCE_BIN is not set; run test/e2e/run.sh")
 	}
-	_ = e.cs.CoreV1().ConfigMaps(ns).Delete(e.ctx, "vmrebalance-blue-green", metav1.DeleteOptions{})
+	_ = e.cs.CoreV1().ConfigMaps(ns).Delete(e.ctx, "vmrebalance.blue.green", metav1.DeleteOptions{})
 
 	at := time.Now().Add(-time.Hour).Truncate(time.Minute)
 	e.seedHistory(at)

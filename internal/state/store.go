@@ -62,12 +62,13 @@ func NewConfigMap(client kubernetes.Interface, namespace string, m Migration) *C
 	return &ConfigMap{client: client, namespace: namespace, name: Name(m), m: m}
 }
 
-// Name is the name of the ConfigMap that holds the state of m: vmrebalance-<from>-<to> for tenant 0, with
-// -<tenant> appended for any other tenant (":" becomes "-").
+// Name is the name of the ConfigMap that holds the state of m: vmrebalance.<from>.<to> for tenant 0, with
+// .tenant-<tenant> appended for any other tenant (":" becomes "-"). The CLI rejects VMCluster names with dots (the
+// operator couldn't name its Services after them anyway), so no two migrations share a name.
 func Name(m Migration) string {
-	name := "vmrebalance-" + m.From + "-" + m.To
+	name := "vmrebalance." + m.From + "." + m.To
 	if t := m.tenant(); t != "0" {
-		name += "-" + strings.ReplaceAll(t, ":", "-")
+		name += ".tenant-" + strings.ReplaceAll(t, ":", "-")
 	}
 	return name
 }

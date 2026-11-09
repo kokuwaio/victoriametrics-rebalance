@@ -58,7 +58,7 @@ func TestPreflightPassesForAReadySetup(t *testing.T) {
 	}
 	for _, name := range []string{
 		check.Operational, check.StorageNodes, check.Version, check.Retention, check.ReplicationFactor,
-		check.Dedup, check.Capacity, check.DualWrite, check.PodLabels,
+		check.Dedup, check.Relabeling, check.Capacity, check.DualWrite, check.PodLabels,
 	} {
 		result(t, r, name)
 	}
@@ -90,6 +90,9 @@ func TestPreflightFindsProblems(t *testing.T) {
 			check.Dedup, check.Fail, "vmselect"},
 		{"dedup disabled on vmstorage", func(_, g *fakeCluster) { g.info.Args[cluster.Storage]["dedup.minScrapeInterval"] = "0s" },
 			check.Dedup, check.Fail, "disabled"},
+		{"green relabels the copied data again", func(_, g *fakeCluster) {
+			g.info.Args[cluster.Insert] = map[string]string{"relabelConfig": "/etc/relabel.yml"}
+		}, check.Relabeling, check.Warn, "/etc/relabel.yml"},
 		{"dedup thins real samples", func(_, g *fakeCluster) {
 			g.info.Args[cluster.Storage]["dedup.minScrapeInterval"] = "30s"
 			g.info.Args[cluster.Select]["dedup.minScrapeInterval"] = "30s"

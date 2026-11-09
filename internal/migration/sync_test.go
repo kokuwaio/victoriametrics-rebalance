@@ -470,3 +470,23 @@ func TestFirstSyncWithAnEmptyRangeRecordsNoBackfillStart(t *testing.T) {
 		t.Errorf("BackfillStart = %v; a corrected --since would be ignored on the next run", got.BackfillStart)
 	}
 }
+
+func TestFinalRetryThatFailsToCopyClearsTheEarlierCompletionTime(t *testing.T) {
+	st := &state.Memory{}
+	_, _ = st.Update(t.Context(), func(s *state.State) { s.SyncedUntil = ts("2026-01-05T10:20:00Z") })
+	cutover := ts("2026-01-05T10:30:00Z")
+	if _, err := newSyncer(&fakeCopier{}, st, ts("2026-01-05T11:00:00Z")).Final(t.Context(), cutover, drainedAt(ts("2026-01-05T11:00:00Z"))); err != nil {
+		t.Fatal(err)
+	}
+
+	failing := newSyncer(copierFunc(func(context.Context, migration.Window, int64) (migration.CopyStats, error) {
+		return migration.CopyStats{}, errTransient
+	}), st, ts("2026-01-05T12:00:00Z"))
+	if _, err := failing.Final(t.Context(), cutover, drainedAt(ts("2026-01-05T12:00:00Z"))); err == nil {
+		t.Fatal("want the copy error")
+	}
+
+	if got, _ := st.Load(t.Context()); !got.FinalSyncAt.IsZero() {
+		t.Errorf("FinalSyncAt = %v although the new window %v–%v wasn't copied", got.FinalSyncAt, got.FinalStart, got.FinalEnd)
+	}
+}

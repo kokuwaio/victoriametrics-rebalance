@@ -115,3 +115,28 @@ func TestDrainDetectsARestartAlthoughTheCounterGrewBackPastItsOldValue(t *testin
 		t.Errorf("drain = %s %q, want an unknown result because the pod restarted in every window", res.Level, res.Message)
 	}
 }
+
+func TestDrainWaitsForRowsQueuedForVMStorage(t *testing.T) {
+	blue := newCluster("blue", 2)
+	// No new rows, but 500 rows wait for vmstorage at the end of the first window.
+	blue.setInserted([]int{1000, 1000, 1000, 1000}, []int{0, 0, 0, 0})
+	blue.setPending([]int{500, 500, 0, 0})
+
+	res := check.WaitDrained(t.Context(), blue, drainOpts)
+
+	if res.Level != check.Pass || len(blue.podGets) != 4 {
+		t.Errorf("drain = %s %q after %d scrapes, want a pass in the second window", res.Level, res.Message, len(blue.podGets))
+	}
+}
+
+func TestDrainFailsWhileRowsStayQueuedForVMStorage(t *testing.T) {
+	blue := newCluster("blue", 2)
+	blue.setInserted([]int{1000, 1000, 1000, 1000, 1000, 1000}, []int{0, 0, 0, 0, 0, 0})
+	blue.setPending([]int{500, 500, 500, 500, 500, 500})
+
+	res := check.WaitDrained(t.Context(), blue, drainOpts)
+
+	if res.Level != check.Fail || !strings.Contains(res.Message, "500 rows for vmstorage") {
+		t.Errorf("drain = %s %q", res.Level, res.Message)
+	}
+}

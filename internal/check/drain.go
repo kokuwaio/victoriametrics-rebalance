@@ -27,24 +27,31 @@ type DrainOptions struct {
 // fails when blue still receives writes after Timeout. A writer that still points at blue writes data that is lost
 // once blue is deleted, so any row counts, not just a high rate. A writer that pushes less often than Interval can
 // slip through, so Interval must be longer than the slowest writer's push interval. A window in which a vminsert pod
-// restarted, appeared or vanished proves nothing and is measured again.
+// restarted, appeared or vanished proves nothing and is measured again. Blue also isn't drained while its vminsert
+// pods still hold rows they accepted but haven't sent to vmstorage, which the final export couldn't read yet.
 func WaitDrained(ctx context.Context, blue cluster.Client, o DrainOptions) Result {
 	if o.Interval <= 0 {
 		return Result{Name: Drain, Level: Fail, Message: "drain interval must be positive"}
 	}
 	attempts := max(1, int(o.Timeout/o.Interval))
-	var lastWrites float64 // the rate of the latest window that saw writes
+	var lastWrites, pending float64 // the rate of the latest window that saw writes; the rows still queued
 	for range attempts {
-		rate, complete, err := insertRate(ctx, blue, o.Interval, o.Sleep, nil)
+		m, err := insertRate(ctx, blue, o.Interval, o.Sleep, nil)
 		if err != nil {
 			return Result{Name: Drain, Level: Fail, Message: err.Error()}
 		}
-		if rate == 0 && complete {
+		pending = m.pending
+		if m.rate == 0 && m.complete && pending == 0 {
 			return Result{Name: Drain, Level: Pass, Message: "blue receives no more writes"}
 		}
-		if rate > 0 {
-			lastWrites = rate
+		if m.rate > 0 {
+			lastWrites = m.rate
 		}
+	}
+	if lastWrites == 0 && pending > 0 {
+		return Result{Name: Drain, Level: Fail, Message: fmt.Sprintf(
+			"blue's vminsert pods still hold %.0f rows for vmstorage after %s: check blue's vmstorage nodes", pending,
+			o.Timeout)}
 	}
 	if lastWrites == 0 {
 		return Result{Name: Drain, Level: Fail, Message: fmt.Sprintf(

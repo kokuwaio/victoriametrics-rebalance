@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/cluster"
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/copier"
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/migration"
+	"github.com/kokuwaio/victoriametrics-rebalance/internal/state"
 )
 
 type syncOptions struct {
@@ -58,9 +60,10 @@ sync (catch-up) until one run takes only minutes, then switch the read and write
 
 sync --final runs after the cutover. It waits until cutover + 15m and checks that blue no longer receives writes;
 if it still does, it stops without copying. Then it copies [last synced point - --final-overlap (1h), the moment
-blue was drained] (from the cutover - --final-overlap if a catch-up already ran past the cutover), resets
-the rollup result cache on every green vmselect pod, and verifies the days it copied. A rerun with the same
---cutover-at covers the first run's window again.`,
+blue was drained] (from the cutover - --final-overlap if a catch-up already ran past the cutover). It waits 30s
+until green can search the copied rows, resets the rollup result cache on every green vmselect pod, verifies the
+days it copied, and fails while any day stored in the state failed verify and hasn't passed since. A rerun with the
+same --cutover-at covers the first run's window again.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runSync(cmd, g, o)
 		},
@@ -288,6 +291,12 @@ func runFinal(ctx context.Context, e *env, o *syncOptions, syncer *migration.Syn
 		return err
 	}
 	e.log.Info("final sync copied", "window", w.String())
+	// vminsert acknowledges rows before vmstorage makes them searchable. Reset the cache and verify only after that,
+	// so neither a cached result nor the count misses the last rows.
+	e.log.Info("waiting for green to make the imported rows searchable", "wait", importSettle)
+	if err := sleep(ctx, importSettle); err != nil {
+		return err
+	}
 
 	results := []check.Result{drain, {Name: check.RollupCache, Level: check.Pass, Message: "reset on every green vmselect pod"}}
 	if err := cluster.ResetRollupCache(ctx, e.green); err != nil {
@@ -295,6 +304,12 @@ func runFinal(ctx context.Context, e *env, o *syncOptions, syncer *migration.Syn
 	}
 	days, err := verifyDays(ctx, e, o.verify, w.Start, w.End)
 	results = append(results, days...)
+	if err == nil {
+		var st *state.State
+		if st, err = e.store.Load(ctx); err == nil {
+			results = append(results, earlierFailures(st, days))
+		}
+	}
 	printReport(e.out, results)
 	if err != nil {
 		return err
@@ -305,6 +320,39 @@ func runFinal(ctx context.Context, e *env, o *syncOptions, syncer *migration.Syn
 	}
 	fmt.Fprintln(e.out, "\nDone. Keep blue for a few days so you can roll back, then delete it and its PVCs.")
 	return nil
+}
+
+// importSettle is how long the final sync waits after copying before it resets green's rollup cache and verifies.
+// vmstorage makes new rows searchable within seconds.
+const importSettle = 30 * time.Second
+
+// earlierFailures reports days in the migrated range (the first full day after the backfill start up to the last
+// synced point) whose stored verify result failed, except those this run already reports as failed. A pass of only
+// part of a day keeps an earlier whole-day failure, so such a day shows up here until a whole-day verify passes.
+// Days outside the range, such as the partly copied day the backfill started on, don't count.
+func earlierFailures(st *state.State, thisRun []check.Result) check.Result {
+	reported := map[string]bool{}
+	for _, r := range thisRun {
+		if r.Level == check.Fail {
+			reported[strings.TrimPrefix(r.Name, "verify ")] = true
+		}
+	}
+	first, last := state.DayKey(firstFullDay(st)), state.DayKey(st.SyncedUntil)
+	var days []string
+	for day, r := range st.Verifications {
+		// Day keys are YYYY-MM-DD, so they compare in date order.
+		if !r.Pass && !reported[day] && day >= first && day <= last {
+			days = append(days, day)
+		}
+	}
+	if len(days) == 0 {
+		return check.Result{Name: "earlier verify", Level: check.Pass, Message: "no failed days stored"}
+	}
+	slices.Sort(days)
+	return check.Result{Name: "earlier verify", Level: check.Fail, Message: fmt.Sprintf(
+		"these days failed verify and haven't passed a whole-day verify since: %s; verify them again, and if green "+
+			"really misses data there, copy those days again (a sync with its own --state-file, --since and --until)",
+		strings.Join(days, ", "))}
 }
 
 func maxTime(a, b time.Time) time.Time {

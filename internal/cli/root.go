@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
@@ -56,7 +57,7 @@ write and switch the aliases (usually in Git); the tool copies the data, checks 
 	f.StringVar(&g.to, "to", "", "name of the new VMCluster (green)")
 	f.StringVar(&g.tenant, "tenant", "0", "tenant ID to copy and check")
 	f.StringVar(&g.access, "access", "auto", "how to reach vmselect and pods: proxy (through the API server), direct (Service DNS and pod IPs), or auto (direct in a pod, proxy otherwise)")
-	f.StringVar(&g.stateFile, "state-file", "", "keep the state in this local file instead of the ConfigMap vmrebalance-<from>-<to> (with -<tenant> for tenants other than 0)")
+	f.StringVar(&g.stateFile, "state-file", "", "keep the state in this local file instead of the ConfigMap vmrebalance.<from>.<to> (with .tenant-<tenant> for tenants other than 0)")
 	f.BoolVarP(&g.verbose, "verbose", "v", false, "log debug output")
 	_ = root.MarkPersistentFlagRequired("from")
 	_ = root.MarkPersistentFlagRequired("to")
@@ -102,6 +103,9 @@ func (g *globalOptions) setup(cmd *cobra.Command, clusters bool) (*env, error) {
 	if g.from == g.to {
 		return nil, fmt.Errorf("--from and --to must name different VMClusters")
 	}
+	if strings.Contains(g.from+g.to, ".") {
+		return nil, fmt.Errorf("--from and --to must not contain dots: the operator names Services after the VMCluster")
+	}
 
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	rules.ExplicitPath = g.kubeconfig
@@ -145,6 +149,9 @@ func (g *globalOptions) setup(cmd *cobra.Command, clusters bool) (*env, error) {
 			return nil, err
 		}
 		if e.green, err = k.Open(cmd.Context(), e.namespace, g.to); err != nil {
+			return nil, err
+		}
+		if err := state.BindClusters(cmd.Context(), e.store, e.blue.Info().UID, e.green.Info().UID); err != nil {
 			return nil, err
 		}
 	}

@@ -112,6 +112,16 @@ func (f *fakeCluster) setInserted(live, native []int) {
 	f.setInsertedWithStarts(live, native, make([]int, len(live)))
 }
 
+// setPending makes the vminsert pods also report successive vm_rpc_rows_pending values, one per scrape.
+func (f *fakeCluster) setPending(pending []int) {
+	for _, p := range f.pods[cluster.Insert] {
+		bodies := f.podResp[p.Name+"/metrics"]
+		for i := range bodies {
+			bodies[i] += fmt.Sprintf("vm_rpc_rows_pending{name=\"vminsert\",addr=\"vmstorage-0:8400\"} %d\n", pending[i])
+		}
+	}
+}
+
 // setInsertedWithStarts is setInserted with a vm_app_start_timestamp per scrape.
 func (f *fakeCluster) setInsertedWithStarts(live, native, started []int) {
 	for _, p := range f.pods[cluster.Insert] {

@@ -50,7 +50,7 @@ sync   [ backfill: now-retention ── now ][ catch-up ── Tc ]      [ final
 | 6. `verify` | tool | Compares blue and green per day. |
 | 7. `sync` | tool | Catch-up: copies from the last synced point to now. Repeat until a run takes only minutes. |
 | 8. Cutover | you | Point the read and write aliases at green. This is Tcut. |
-| 9. `sync --final` | tool | Waits until `Tcut + 15m` and checks that blue no longer receives writes (if it still does, it stops without copying). Then copies `[last synced point - --final-overlap (1h), the moment blue was drained]` (from `Tcut - --final-overlap` if a catch-up already ran past the cutover), resets green's rollup cache, and verifies the copied days. |
+| 9. `sync --final` | tool | Waits until `Tcut + 15m` and checks that blue no longer receives writes (if it still does, it stops without copying). Then copies `[last synced point - --final-overlap (1h), the moment blue was drained]` (from `Tcut - --final-overlap` if a catch-up already ran past the cutover), waits 30s until green can search the rows, resets green's rollup cache, verifies the copied days, and checks that no earlier verified day still fails. |
 | 10. Soak and delete | you | Keep blue for a few days so you can roll back, then delete blue and its PVCs. |
 
 Why dual write *and* a final sync:
@@ -124,8 +124,8 @@ Run `vmrebalance <command> --help` for all flags. The most important ones:
   `--final-overlap` (default 1h) is how far before the last synced point the final window starts.
   `--drain-interval` (default 5m) must be longer than the push interval of your slowest writer: blue passes only
   when it receives no rows at all during one whole interval.
-- `--state-file state.json`: keep the state in a local file instead of the ConfigMap `vmrebalance-<from>-<to>`
-  (`vmrebalance-<from>-<to>-<tenant>` for tenants other than 0; each tenant has its own state).
+- `--state-file state.json`: keep the state in a local file instead of the ConfigMap `vmrebalance.<from>.<to>`
+  (`vmrebalance.<from>.<to>.tenant-<tenant>` for tenants other than 0; each tenant has its own state).
   This is fine on a workstation. A Job needs the ConfigMap, because its pod loses local files when it restarts.
 - `--access proxy|direct`: how the tool reaches vmselect and the pods. `proxy` goes through the Kubernetes API
   server and works from any workstation, but the API server cuts requests off after its request timeout (1 minute
@@ -152,7 +152,10 @@ from a workstation without port-forwarding.
   - all components run the same image tags (the native format is version-coupled);
   - same retention and replication factor;
   - green deduplicates, with exactly `1ms` (a larger value also merges real samples, so it warns);
-  - green's vmstorage nodes have free space for blue's used bytes plus headroom;
+  - green's vminsert doesn't relabel (it warns otherwise: the copied data, already relabeled by blue, would be
+    relabeled again, so the rules must not change their own output);
+  - green's vmstorage nodes have free space for blue's used bytes plus headroom, in total and each node for its
+    share;
   - green receives live writes, and which share of blue's (the rest relies on the final sync);
   - no PodDisruptionBudget or topology spread selector matches pods of both clusters.
 - `verify` only reads from the clusters, so it can run at any time, also during a sync. Per UTC day it compares the
@@ -161,9 +164,11 @@ from a workstation without port-forwarding.
   and samples as blue, minus a tolerance (default 1%). On a partial first or last day only the sample counts within
   the range are compared, because the day's series count also includes series outside it.
 - `sync --final`: before copying, blue's vminsert receives no rows during one `--drain-interval` within
-  `--drain-timeout`, otherwise some writer still points at blue (a window in which a vminsert pod restarted counts
-  as unknown and is measured again); rollup cache reset on every green vmselect pod, so no pod serves results
-  cached before the backfill; `verify` for the days the final sync copied, failing on partial responses.
+  `--drain-timeout` and holds no rows still queued for vmstorage, otherwise some writer still points at blue (a
+  window in which a vminsert pod restarted counts as unknown and is measured again). After copying, it waits 30
+  seconds until green has made the rows searchable, then resets the rollup cache on every green vmselect pod, so no
+  pod serves results cached before the backfill, and runs `verify` for the days the final sync copied, failing on
+  partial responses. It also fails while any day stored in the state failed verify and hasn't passed since.
 
 ## Risks
 

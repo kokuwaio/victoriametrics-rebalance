@@ -168,6 +168,8 @@ func (s *Syncer) Final(ctx context.Context, cutover time.Time, drained func(cont
 	if _, err := s.Store.Update(ctx, func(st *state.State) {
 		st.CutoverAt = cutover
 		st.FinalStart, st.FinalEnd = w.Start, w.End
+		// Set again once this window is copied; until then status must not show an earlier run as done.
+		st.FinalSyncAt = time.Time{}
 	}); err != nil {
 		return Window{}, fmt.Errorf("save state: %w", err)
 	}

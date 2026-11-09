@@ -26,6 +26,7 @@ const (
 	Capacity          = "capacity"
 	DualWrite         = "dual write"
 	PodLabels         = "pod labels"
+	Relabeling        = "relabeling"
 )
 
 const dedupFlag = "dedup.minScrapeInterval"
@@ -62,6 +63,7 @@ func Preflight(ctx context.Context, blue, green cluster.Client, o PreflightOptio
 		r.add(ReplicationFactor, Fail, "blue %d, green %d", blueInfo.ReplicationFactor, greenInfo.ReplicationFactor)
 	}
 	dedup(&r, greenInfo)
+	relabeling(&r, greenInfo)
 	capacity(ctx, &r, blue, green, o.Headroom)
 	dualWrite(ctx, &r, blue, green, o)
 	podLabels(ctx, &r, blue, green)
@@ -180,6 +182,18 @@ func dedup(r *Report, g cluster.Info) {
 	r.add(Dedup, Pass, "green: -%s=1ms", dedupFlag)
 }
 
+// relabeling warns when green's vminsert relabels incoming data. The sync imports blue's data, which blue's vminsert
+// already relabeled, through green's vminsert, so the rules run twice on it. Rules that change their own output
+// (e.g. adding a prefix) then give copied series other labels than the live ones.
+func relabeling(r *Report, g cluster.Info) {
+	if cfg := g.Args[cluster.Insert]["relabelConfig"]; cfg != "" {
+		r.add(Relabeling, Warn, "green's vminsert relabels with %s, also the copied data, which blue already relabeled: "+
+			"make sure applying the rules twice changes nothing, or remove them for the migration", cfg)
+		return
+	}
+	r.add(Relabeling, Pass, "green's vminsert doesn't relabel")
+}
+
 // capacity compares blue's used bytes (vm_data_size_bytes) with green's free disk space (vm_free_disk_space_bytes),
 // both scraped from every vmstorage pod.
 func capacity(ctx context.Context, r *Report, blue, green cluster.Client, headroom float64) {
@@ -228,10 +242,11 @@ func dualWrite(ctx context.Context, r *Report, blue, green cluster.Client, o Pre
 	}
 	done := make(chan rate, 1)
 	go func() {
-		v, _, err := insertRate(ctx, blue, o.RateWindow, o.Sleep, nil)
-		done <- rate{v, err}
+		m, err := insertRate(ctx, blue, o.RateWindow, o.Sleep, nil)
+		done <- rate{m.rate, err}
 	}()
-	gr, _, gerr := insertRate(ctx, green, o.RateWindow, o.Sleep, func(l map[string]string) bool { return l["type"] != "native" })
+	gm, gerr := insertRate(ctx, green, o.RateWindow, o.Sleep, func(l map[string]string) bool { return l["type"] != "native" })
+	gr := gm.rate
 	b := <-done
 	br := b.v
 	if err := firstErr(b.err, gerr); err != nil {

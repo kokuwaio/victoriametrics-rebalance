@@ -71,8 +71,8 @@ type Sleeper func(ctx context.Context, d time.Duration) error
 // vanished in between are left out of the rate, and complete is false: what those pods received is unknown, so a
 // rate of 0 doesn't prove there were no writes.
 func insertRate(ctx context.Context, c cluster.Client, window time.Duration, sleep Sleeper,
-	keep func(map[string]string) bool) (rate float64, complete bool, err error) {
-	type reading struct{ rows, started float64 }
+	keep func(map[string]string) bool) (ingestion, error) {
+	type reading struct{ rows, started, pending float64 }
 	read := func() (map[string]reading, error) {
 		samples, err := scrapeAll(ctx, c, cluster.Insert)
 		if err != nil {
@@ -80,33 +80,52 @@ func insertRate(ctx context.Context, c cluster.Client, window time.Duration, sle
 		}
 		out := map[string]reading{}
 		for pod, s := range samples {
-			out[pod] = reading{rows: vm.Sum(s, rowsInserted, keep), started: vm.Sum(s, appStarted, nil)}
+			out[pod] = reading{
+				rows:    vm.Sum(s, rowsInserted, keep),
+				started: vm.Sum(s, appStarted, nil),
+				pending: vm.Sum(s, rowsPending, nil),
+			}
 		}
 		return out, nil
 	}
 	before, err := read()
 	if err != nil {
-		return 0, false, err
+		return ingestion{}, err
 	}
 	if err := sleep(ctx, window); err != nil {
-		return 0, false, err
+		return ingestion{}, err
 	}
 	after, err := read()
 	if err != nil {
-		return 0, false, err
+		return ingestion{}, err
 	}
 	var rows float64
-	complete = len(before) == len(after)
+	m := ingestion{complete: len(before) == len(after)}
 	for pod, a := range after {
 		b, ok := before[pod]
+		m.pending += a.pending
 		if !ok || a.started != b.started || a.rows < b.rows {
-			complete = false
+			m.complete = false
 			continue
 		}
 		rows += a.rows - b.rows
 	}
-	return rows / window.Seconds(), complete, nil
+	m.rate = rows / window.Seconds()
+	return m, nil
 }
+
+// ingestion is what insertRate measured.
+type ingestion struct {
+	// rate is the rows per second the vminsert pods accepted.
+	rate float64
+	// complete is false when a pod restarted, appeared or vanished during the window.
+	complete bool
+	// pending is the rows the vminsert pods accepted but haven't sent to vmstorage yet, at the end of the window.
+	pending float64
+}
+
+// rowsPending counts rows a vminsert pod buffers for a vmstorage node.
+const rowsPending = "vm_rpc_rows_pending"
 
 // appStarted is when a VictoriaMetrics process started (Unix seconds).
 const appStarted = "vm_app_start_timestamp"
