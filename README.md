@@ -23,6 +23,20 @@ usually in Git. The tool copies the data, checks every step and tells you what's
 is deleted as a whole at the end), growing PVCs (the operator already supports that), and changing the Kubernetes
 objects for you.
 
+### Logs and traces
+
+The tool works only for VictoriaMetrics metrics clusters (`VMCluster`). VictoriaLogs and VictoriaTraces clusters
+don't need a blue/green migration. Their storage nodes keep the data in self-contained per-day partitions and can
+detach and attach a partition while they run (`/internal/partition/detach` and `/internal/partition/attach`). So
+historical data can be moved to new storage nodes in place: snapshot a day's partition on an old node, copy it into
+the new node's `partitions` directory, detach it on the old node and attach it on the new one. vmstorage has no such
+mechanism, and moving data between its nodes is unsafe because of the metricID collisions above, which is why this
+tool copies the data into a new cluster instead.
+
+See the VictoriaLogs docs on [rebalancing](https://docs.victoriametrics.com/victorialogs/cluster/#rebalancing) and
+the [partitions lifecycle](https://docs.victoriametrics.com/victorialogs/#partitions-lifecycle). VictoriaTraces has
+the [same endpoints](https://docs.victoriametrics.com/victoriatraces/#partitions-lifecycle).
+
 Documentation:
 
 - [docs/usage.md](docs/usage.md): a step-by-step migration with example manifests, how to watch the progress, all
