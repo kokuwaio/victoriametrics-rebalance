@@ -1,0 +1,106 @@
+// Package state records the progress of one migration, so that a run restarted after a crash or pod eviction
+// continues where it stopped.
+package state
+
+import (
+	"context"
+	"maps"
+	"sync"
+	"time"
+)
+
+// MaxChunks caps the chunk history kept in the state. SyncedUntil is what resuming relies on; the history only
+// feeds `status`, and an unbounded list would outgrow a ConfigMap on long retentions with small steps.
+const MaxChunks = 500
+
+// State is everything the tool remembers about one migration from one cluster to another.
+type State struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+
+	// DualWriteSeenAt is when preflight first saw green receive live writes (T0, or a little after it).
+	DualWriteSeenAt time.Time `json:"dualWriteSeenAt,omitzero"`
+	// BackfillStart is where the first sync started (now - retention at that time).
+	BackfillStart time.Time `json:"backfillStart,omitzero"`
+	// SyncedUntil is the end of the last finished chunk. The next sync continues from here.
+	SyncedUntil time.Time `json:"syncedUntil,omitzero"`
+	// Chunks is the history of finished chunks, oldest first, capped at MaxChunks.
+	Chunks []Chunk `json:"chunks,omitempty"`
+
+	// Verifications holds the latest verify result per day (key: YYYY-MM-DD, UTC).
+	Verifications map[string]DayResult `json:"verifications,omitempty"`
+
+	CutoverAt   time.Time `json:"cutoverAt,omitzero"`
+	FinalSyncAt time.Time `json:"finalSyncAt,omitzero"`
+	// FinalStart and FinalEnd are the time range the final sync copied.
+	FinalStart time.Time `json:"finalStart,omitzero"`
+	FinalEnd   time.Time `json:"finalEnd,omitzero"`
+}
+
+// Chunk is one finished copy of a time window.
+type Chunk struct {
+	Start      time.Time `json:"start"`
+	End        time.Time `json:"end"`
+	Bytes      int64     `json:"bytes,omitempty"`
+	Seconds    float64   `json:"seconds"`
+	FinishedAt time.Time `json:"finishedAt"`
+}
+
+// DayResult is the outcome of comparing one day between blue and green.
+type DayResult struct {
+	Pass        bool      `json:"pass"`
+	BlueSeries  int64     `json:"blueSeries"`
+	GreenSeries int64     `json:"greenSeries"`
+	Problems    []string  `json:"problems,omitempty"`
+	CheckedAt   time.Time `json:"checkedAt"`
+}
+
+// AddChunk appends a finished chunk, moves SyncedUntil forward and trims the history to MaxChunks.
+func (s *State) AddChunk(c Chunk) {
+	s.Chunks = append(s.Chunks, c)
+	if len(s.Chunks) > MaxChunks {
+		s.Chunks = s.Chunks[len(s.Chunks)-MaxChunks:]
+	}
+	if c.End.After(s.SyncedUntil) {
+		s.SyncedUntil = c.End
+	}
+}
+
+// SetVerification stores the result for the day that starts at day (UTC).
+func (s *State) SetVerification(day time.Time, r DayResult) {
+	if s.Verifications == nil {
+		s.Verifications = map[string]DayResult{}
+	}
+	s.Verifications[DayKey(day)] = r
+}
+
+// DayKey formats the UTC day of t as YYYY-MM-DD.
+func DayKey(t time.Time) string { return t.UTC().Format(time.DateOnly) }
+
+// Memory is a Store that keeps the state in memory, for tests.
+type Memory struct {
+	mu sync.Mutex
+	s  State
+}
+
+// Load returns a copy of the stored state.
+func (m *Memory) Load(context.Context) (*State, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.s.clone(), nil
+}
+
+// Update applies change to the stored state.
+func (m *Memory) Update(_ context.Context, change func(*State)) (*State, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	change(&m.s)
+	return m.s.clone(), nil
+}
+
+func (s *State) clone() *State {
+	c := *s
+	c.Chunks = append([]Chunk(nil), s.Chunks...)
+	c.Verifications = maps.Clone(s.Verifications)
+	return &c
+}

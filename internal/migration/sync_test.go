@@ -1,0 +1,226 @@
+package migration_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/kokuwaio/victoriametrics-rebalance/internal/migration"
+	"github.com/kokuwaio/victoriametrics-rebalance/internal/state"
+)
+
+func ts(s string) time.Time {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		panic(err)
+	}
+	return t
+}
+
+// fakeCopier records every window it is asked to copy. failures[i] is the number of times the i-th distinct
+// window fails before it succeeds.
+type fakeCopier struct {
+	calls    []migration.Window
+	failures map[migration.Window]int
+}
+
+func (f *fakeCopier) Copy(_ context.Context, w migration.Window) (migration.CopyStats, error) {
+	f.calls = append(f.calls, w)
+	if f.failures[w] > 0 {
+		f.failures[w]--
+		return migration.CopyStats{}, errTransient
+	}
+	return migration.CopyStats{Bytes: 100}, nil
+}
+
+type transientError struct{}
+
+func (transientError) Error() string { return "transient" }
+
+var errTransient = transientError{}
+
+func newSyncer(c migration.Copier, st state.Store, now time.Time) *migration.Syncer {
+	return &migration.Syncer{
+		Copier:  c,
+		Store:   st,
+		Step:    24 * time.Hour,
+		Retries: 2,
+		Backoff: time.Second,
+		Now:     func() time.Time { return now },
+		Sleep:   func(context.Context, time.Duration) error { return nil },
+	}
+}
+
+func windows(pairs ...string) []migration.Window {
+	var out []migration.Window
+	for i := 0; i < len(pairs); i += 2 {
+		out = append(out, migration.Window{Start: ts(pairs[i]), End: ts(pairs[i+1])})
+	}
+	return out
+}
+
+func assertWindows(t *testing.T, got, want []migration.Window) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %d windows %v, want %d %v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if !got[i].Start.Equal(want[i].Start) || !got[i].End.Equal(want[i].End) {
+			t.Errorf("window %d: got %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestFirstSyncCopiesFromStartToUntilInDayAlignedChunks(t *testing.T) {
+	st := &state.Memory{}
+	c := &fakeCopier{}
+	s := newSyncer(c, st, ts("2026-01-03T06:00:00Z"))
+
+	if err := s.Sync(t.Context(), ts("2026-01-01T10:00:00Z"), ts("2026-01-03T05:00:00Z")); err != nil {
+		t.Fatal(err)
+	}
+
+	assertWindows(t, c.calls, windows(
+		"2026-01-01T10:00:00Z", "2026-01-02T00:00:00Z",
+		"2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z",
+		"2026-01-03T00:00:00Z", "2026-01-03T05:00:00Z",
+	))
+	got, _ := st.Load(t.Context())
+	if !got.BackfillStart.Equal(ts("2026-01-01T10:00:00Z")) {
+		t.Errorf("BackfillStart = %v", got.BackfillStart)
+	}
+	if !got.SyncedUntil.Equal(ts("2026-01-03T05:00:00Z")) {
+		t.Errorf("SyncedUntil = %v", got.SyncedUntil)
+	}
+	if len(got.Chunks) != 3 || got.Chunks[0].Bytes != 100 {
+		t.Errorf("chunks = %+v", got.Chunks)
+	}
+}
+
+func TestSyncResumesAfterLastFinishedChunkAndIgnoresStart(t *testing.T) {
+	st := &state.Memory{}
+	_, _ = st.Update(t.Context(), func(s *state.State) {
+		*s = state.State{
+			BackfillStart: ts("2026-01-01T10:00:00Z"),
+			SyncedUntil:   ts("2026-01-02T00:00:00Z"),
+		}
+	})
+	c := &fakeCopier{}
+	s := newSyncer(c, st, ts("2026-01-03T06:00:00Z"))
+
+	if err := s.Sync(t.Context(), ts("2025-12-01T00:00:00Z"), ts("2026-01-02T12:00:00Z")); err != nil {
+		t.Fatal(err)
+	}
+
+	assertWindows(t, c.calls, windows("2026-01-02T00:00:00Z", "2026-01-02T12:00:00Z"))
+	got, _ := st.Load(t.Context())
+	if !got.BackfillStart.Equal(ts("2026-01-01T10:00:00Z")) {
+		t.Errorf("BackfillStart changed to %v", got.BackfillStart)
+	}
+}
+
+func TestSyncCrashMidwayKeepsFinishedChunksForTheNextRun(t *testing.T) {
+	st := &state.Memory{}
+	failing := migration.Window{Start: ts("2026-01-02T00:00:00Z"), End: ts("2026-01-03T00:00:00Z")}
+	c := &fakeCopier{failures: map[migration.Window]int{failing: 99}}
+	s := newSyncer(c, st, ts("2026-01-03T06:00:00Z"))
+
+	if err := s.Sync(t.Context(), ts("2026-01-01T00:00:00Z"), ts("2026-01-03T00:00:00Z")); err == nil {
+		t.Fatal("want error for a chunk that keeps failing")
+	}
+
+	got, _ := st.Load(t.Context())
+	if !got.SyncedUntil.Equal(ts("2026-01-02T00:00:00Z")) {
+		t.Errorf("SyncedUntil = %v, want the end of the first chunk", got.SyncedUntil)
+	}
+}
+
+func TestSyncRetriesAFailedChunkWithDoublingBackoff(t *testing.T) {
+	st := &state.Memory{}
+	w := migration.Window{Start: ts("2026-01-01T00:00:00Z"), End: ts("2026-01-02T00:00:00Z")}
+	c := &fakeCopier{failures: map[migration.Window]int{w: 2}}
+	s := newSyncer(c, st, ts("2026-01-03T06:00:00Z"))
+	var waits []time.Duration
+	s.Sleep = func(_ context.Context, d time.Duration) error { waits = append(waits, d); return nil }
+
+	if err := s.Sync(t.Context(), w.Start, w.End); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(c.calls) != 3 {
+		t.Errorf("copy called %d times, want 3", len(c.calls))
+	}
+	if len(waits) != 2 || waits[0] != time.Second || waits[1] != 2*time.Second {
+		t.Errorf("waits = %v, want [1s 2s]", waits)
+	}
+}
+
+func TestSyncGivesUpAfterRetriesAreExhausted(t *testing.T) {
+	w := migration.Window{Start: ts("2026-01-01T00:00:00Z"), End: ts("2026-01-02T00:00:00Z")}
+	c := &fakeCopier{failures: map[migration.Window]int{w: 3}}
+	s := newSyncer(c, &state.Memory{}, ts("2026-01-03T06:00:00Z"))
+
+	if err := s.Sync(t.Context(), w.Start, w.End); err == nil {
+		t.Fatal("want error")
+	}
+	if len(c.calls) != 3 {
+		t.Errorf("copy called %d times, want 1 + 2 retries", len(c.calls))
+	}
+}
+
+func TestFinalCopiesFromOneHourBeforeLastSyncToFifteenMinutesAfterCutover(t *testing.T) {
+	st := &state.Memory{}
+	_, _ = st.Update(t.Context(), func(s *state.State) { *s = state.State{SyncedUntil: ts("2026-01-05T10:20:00Z")} })
+	c := &fakeCopier{}
+	s := newSyncer(c, st, ts("2026-01-05T11:00:00Z"))
+
+	w, err := s.Final(t.Context(), ts("2026-01-05T10:30:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := windows("2026-01-05T09:20:00Z", "2026-01-05T10:45:00Z")
+	assertWindows(t, []migration.Window{w}, want)
+	assertWindows(t, c.calls, want)
+	got, _ := st.Load(t.Context())
+	if !got.CutoverAt.Equal(ts("2026-01-05T10:30:00Z")) || !got.FinalStart.Equal(want[0].Start) ||
+		!got.FinalEnd.Equal(want[0].End) || got.FinalSyncAt.IsZero() {
+		t.Errorf("final not recorded: %+v", got)
+	}
+	if !got.SyncedUntil.Equal(want[0].End) {
+		t.Errorf("SyncedUntil = %v", got.SyncedUntil)
+	}
+}
+
+func TestFinalWaitsUntilFifteenMinutesAfterCutover(t *testing.T) {
+	st := &state.Memory{}
+	_, _ = st.Update(t.Context(), func(s *state.State) { *s = state.State{SyncedUntil: ts("2026-01-05T10:20:00Z")} })
+	s := newSyncer(&fakeCopier{}, st, ts("2026-01-05T10:35:00Z"))
+	var waits []time.Duration
+	s.Sleep = func(_ context.Context, d time.Duration) error { waits = append(waits, d); return nil }
+
+	if _, err := s.Final(t.Context(), ts("2026-01-05T10:30:00Z")); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(waits) != 1 || waits[0] != 10*time.Minute {
+		t.Errorf("waits = %v, want [10m]", waits)
+	}
+}
+
+func TestFinalRefusesToRunBeforeAnySync(t *testing.T) {
+	s := newSyncer(&fakeCopier{}, &state.Memory{}, ts("2026-01-05T11:00:00Z"))
+
+	if _, err := s.Final(t.Context(), ts("2026-01-05T10:30:00Z")); err == nil {
+		t.Fatal("want error when nothing was synced yet")
+	}
+}
+
+func TestSyncRejectsANonPositiveStep(t *testing.T) {
+	s := newSyncer(&fakeCopier{}, &state.Memory{}, ts("2026-01-03T06:00:00Z"))
+	s.Step = 0
+
+	if err := s.Sync(t.Context(), ts("2026-01-01T00:00:00Z"), ts("2026-01-02T00:00:00Z")); err == nil {
+		t.Fatal("want an error for step 0 instead of an endless loop")
+	}
+}

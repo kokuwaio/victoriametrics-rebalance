@@ -1,0 +1,46 @@
+# Permissions for running vmrebalance as a Job in the namespace of both VMClusters.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vmrebalance
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vmrebalance
+  namespace: monitoring
+rules:
+  # Read both VMClusters.
+  - apiGroups: [operator.victoriametrics.com]
+    resources: [vmclusters]
+    verbs: [get]
+  # Find the vmstorage, vmselect and vminsert pods; check pod labels against PodDisruptionBudgets.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [list]
+  # Only needed with --access=proxy (the default outside a pod): reach vmselect and pods through the API server.
+  - apiGroups: [""]
+    resources: [pods/proxy, services/proxy]
+    verbs: [get]
+  # The state: one ConfigMap per migration, vmrebalance-<from>-<to>.
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vmrebalance
+  namespace: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vmrebalance
+subjects:
+  - kind: ServiceAccount
+    name: vmrebalance
+    namespace: monitoring

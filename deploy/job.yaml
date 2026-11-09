@@ -1,0 +1,55 @@
+# One sync run (backfill or catch-up). Recreate the Job for every run: delete it, then apply it again.
+#
+# For the final sync after cutover, use the same Job with these args (the time is when you switched the aliases):
+#   - sync
+#   - --final
+#   - --from=vmcluster
+#   - --to=vmcluster-b
+#   - --cutover-at=2026-01-02T10:00:00Z
+# The final run waits until 15 minutes after the cutover, so set no activeDeadlineSeconds shorter than that plus
+# --drain-timeout (default 20m).
+# The state lives in the ConfigMap vmrebalance-<from>-<to>, so a pod that is evicted or restarted continues with
+# the first unfinished chunk.
+#
+# Inside the cluster the tool connects to the Services and pods directly (--access=auto picks direct). If
+# NetworkPolicies restrict the namespace, allow this pod to reach vmselect (8481), vminsert (8480) and
+# vmstorage (8482).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vmrebalance-sync
+  namespace: monitoring
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vmrebalance
+    spec:
+      serviceAccountName: vmrebalance
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: vmrebalance
+          # No image is published yet: build one from the Dockerfile and push it to your registry.
+          image: vmrebalance:dev
+          args:
+            - sync
+            - --from=vmcluster
+            - --to=vmcluster-b
+            - --rate-limit=50MiB/s
+            - --concurrency=2
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]

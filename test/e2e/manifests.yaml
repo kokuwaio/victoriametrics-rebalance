@@ -1,0 +1,74 @@
+# Two small VMClusters and a VMAgent that writes to both (dual write), for the end-to-end test.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMCluster
+metadata:
+  name: blue
+  namespace: monitoring
+spec:
+  retentionPeriod: 7d
+  replicationFactor: 1
+  clusterVersion: v1.154.1-cluster
+  vmstorage:
+    replicaCount: 1
+    storage:
+      volumeClaimTemplate:
+        spec:
+          resources:
+            requests:
+              storage: 1Gi
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+  vmselect:
+    replicaCount: 1
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+  vminsert:
+    replicaCount: 1
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMCluster
+metadata:
+  name: green
+  namespace: monitoring
+spec:
+  retentionPeriod: 7d
+  replicationFactor: 1
+  clusterVersion: v1.154.1-cluster
+  vmstorage:
+    replicaCount: 2
+    extraArgs:
+      dedup.minScrapeInterval: 1ms
+    storage:
+      volumeClaimTemplate:
+        spec:
+          resources:
+            requests:
+              storage: 1Gi
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+  vmselect:
+    replicaCount: 1
+    extraArgs:
+      dedup.minScrapeInterval: 1ms
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+  vminsert:
+    replicaCount: 1
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAgent
+metadata:
+  name: agent
+  namespace: monitoring
+spec:
+  selectAllByDefault: true
+  scrapeInterval: 10s
+  remoteWrite:
+    - url: http://vminsert-blue.monitoring.svc:8480/insert/0/prometheus/api/v1/write
+    - url: http://vminsert-green.monitoring.svc:8480/insert/0/prometheus/api/v1/write
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}

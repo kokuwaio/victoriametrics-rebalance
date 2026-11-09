@@ -1,0 +1,165 @@
+package state_test
+
+import (
+	"path/filepath"
+	"strconv"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
+
+	"github.com/kokuwaio/victoriametrics-rebalance/internal/state"
+)
+
+var synced = time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+
+func sample() *state.State {
+	s := &state.State{From: "blue", To: "green", BackfillStart: synced.Add(-24 * time.Hour)}
+	s.AddChunk(state.Chunk{Start: synced.Add(-24 * time.Hour), End: synced, Bytes: 42, Seconds: 1.5, FinishedAt: synced})
+	s.SetVerification(synced, state.DayResult{Pass: true, BlueSeries: 10, GreenSeries: 10, CheckedAt: synced})
+	return s
+}
+
+// apiServer returns a fake clientset that, like a real API server, sets a new resourceVersion on every write and
+// rejects an update whose resourceVersion is stale. client-go's fake tracker does neither.
+func apiServer() *fake.Clientset { return apiServerWithInterleave(nil) }
+
+// apiServerWithInterleave is apiServer, but right before the first update it lets another writer change the stored
+// ConfigMap, so that update carries a stale resourceVersion.
+func apiServerWithInterleave(other func(cm *corev1.ConfigMap)) *fake.Clientset {
+	cs := fake.NewClientset()
+	gvr := corev1.SchemeGroupVersion.WithResource("configmaps")
+	rv := 0
+	write := func(a k8stesting.Action) (bool, runtime.Object, error) {
+		cm := a.(interface{ GetObject() runtime.Object }).GetObject().(*corev1.ConfigMap).DeepCopy()
+		if a.GetVerb() == "update" {
+			obj, err := cs.Tracker().Get(gvr, cm.Namespace, cm.Name)
+			if err != nil {
+				return true, nil, err
+			}
+			cur := obj.(*corev1.ConfigMap)
+			if other != nil {
+				cur = cur.DeepCopy()
+				other(cur)
+				other = nil
+				rv++
+				cur.ResourceVersion = strconv.Itoa(rv)
+				if err := cs.Tracker().Update(gvr, cur, cur.Namespace); err != nil {
+					return true, nil, err
+				}
+			}
+			if cur.ResourceVersion != cm.ResourceVersion {
+				return true, nil, apierrors.NewConflict(gvr.GroupResource(), cm.Name, nil)
+			}
+		}
+		rv++
+		cm.ResourceVersion = strconv.Itoa(rv)
+		if a.GetVerb() == "create" {
+			return true, cm, cs.Tracker().Create(gvr, cm, cm.Namespace)
+		}
+		return true, cm, cs.Tracker().Update(gvr, cm, cm.Namespace)
+	}
+	cs.PrependReactor("create", "configmaps", write)
+	cs.PrependReactor("update", "configmaps", write)
+	return cs
+}
+
+func assertRoundTrip(t *testing.T, got *state.State) {
+	t.Helper()
+	if got.From != "blue" || got.To != "green" || !got.SyncedUntil.Equal(synced) || len(got.Chunks) != 1 ||
+		got.Chunks[0].Bytes != 42 || !got.Verifications["2026-01-02"].Pass {
+		t.Errorf("state did not survive the round trip: %+v", got)
+	}
+}
+
+func TestConfigMapStoreLoadsEmptyStateBeforeTheFirstSave(t *testing.T) {
+	s := state.NewConfigMap(apiServer(), "monitoring", "blue", "green")
+
+	got, err := s.Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got.From != "blue" || got.To != "green" || !got.SyncedUntil.IsZero() {
+		t.Errorf("got %+v, want an empty state for blue → green", got)
+	}
+}
+
+func TestConfigMapStoreRoundTrip(t *testing.T) {
+	cs := apiServer()
+	s := state.NewConfigMap(cs, "monitoring", "blue", "green")
+	if _, err := s.Load(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	replace := func(st *state.State) { *st = *sample() }
+	if _, err := s.Update(t.Context(), replace); err != nil {
+		t.Fatal(err)
+	}
+	// The second update changes the existing ConfigMap.
+	if _, err := s.Update(t.Context(), replace); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := state.NewConfigMap(cs, "monitoring", "blue", "green").Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRoundTrip(t, got)
+	cm, err := cs.CoreV1().ConfigMaps("monitoring").Get(t.Context(), "vmrebalance-blue-green", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("ConfigMap vmrebalance-blue-green: %v", err)
+	}
+	if cm.Labels["app.kubernetes.io/managed-by"] != "vmrebalance" {
+		t.Errorf("labels = %v", cm.Labels)
+	}
+}
+
+func TestConfigMapStoreUpdateKeepsAConcurrentWritersChanges(t *testing.T) {
+	// Another run (say, verify during a sync Job) records a verification between our read and our write.
+	cs := apiServerWithInterleave(func(cm *corev1.ConfigMap) {
+		cm.Data["state.json"] = `{"from":"blue","to":"green","verifications":{"2026-01-01":{"pass":true,"blueSeries":1,"greenSeries":1,"checkedAt":"2026-01-02T00:00:00Z"}}}`
+	})
+	s := state.NewConfigMap(cs, "monitoring", "blue", "green")
+	if _, err := s.Update(t.Context(), func(*state.State) {}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.Update(t.Context(), func(st *state.State) {
+		st.AddChunk(state.Chunk{Start: synced.Add(-time.Hour), End: synced})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !got.SyncedUntil.Equal(synced) || !got.Verifications["2026-01-01"].Pass {
+		t.Errorf("want both the chunk and the other writer's verification, got %+v", got)
+	}
+	stored, _ := state.NewConfigMap(cs, "monitoring", "blue", "green").Load(t.Context())
+	if !stored.SyncedUntil.Equal(synced) || !stored.Verifications["2026-01-01"].Pass {
+		t.Errorf("stored state lost a change: %+v", stored)
+	}
+}
+
+func TestFileStoreRoundTripAndEmptyStateForAMissingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := state.NewFile(path, "blue", "green")
+
+	empty, err := s.Load(t.Context())
+	if err != nil || empty.From != "blue" || empty.To != "green" || !empty.SyncedUntil.IsZero() {
+		t.Fatalf("Load of a missing file = %+v, %v", empty, err)
+	}
+	if _, err := s.Update(t.Context(), func(st *state.State) { *st = *sample() }); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := state.NewFile(path, "blue", "green").Load(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRoundTrip(t, got)
+}
