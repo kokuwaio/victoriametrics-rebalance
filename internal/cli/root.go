@@ -35,8 +35,8 @@ type globalOptions struct {
 	verbose    bool
 }
 
-// NewRoot returns the vmrebalance root command.
-func NewRoot() *cobra.Command {
+// NewRoot returns the vmrebalance root command. version is printed by --version.
+func NewRoot(version string) *cobra.Command {
 	g := &globalOptions{}
 	root := &cobra.Command{
 		Use:   "vmrebalance",
@@ -48,7 +48,9 @@ It never deletes data and never changes VMCluster, VMAgent or Service objects: y
 write and switch the aliases (usually in Git); the tool copies the data, checks every step and says what's due.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Version:       version,
 	}
+	root.SetVersionTemplate("vmrebalance {{.Version}}\n")
 	f := root.PersistentFlags()
 	f.StringVar(&g.kubeconfig, "kubeconfig", "", "path to the kubeconfig file (default: $KUBECONFIG, ~/.kube/config, or in-cluster)")
 	f.StringVar(&g.context, "context", "", "kubeconfig context to use")
@@ -67,8 +69,8 @@ write and switch the aliases (usually in Git); the tool copies the data, checks 
 }
 
 // Execute runs the root command and returns the process exit code.
-func Execute(ctx context.Context) int {
-	if err := NewRoot().ExecuteContext(ctx); err != nil {
+func Execute(ctx context.Context, version string) int {
+	if err := NewRoot(version).ExecuteContext(ctx); err != nil {
 		if !errors.Is(err, errChecksFailed) {
 			fmt.Fprintln(os.Stderr, "error:", err)
 		}

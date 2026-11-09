@@ -128,3 +128,17 @@ func TestEarlierFailuresBlockTheFinalSync(t *testing.T) {
 		t.Errorf("without stored failures: %s %q", r.Level, r.Message)
 	}
 }
+
+func TestVersionFlagPrintsTheVersionWithoutOtherFlags(t *testing.T) {
+	root := NewRoot("1.2.3")
+	var out strings.Builder
+	root.SetOut(&out)
+	root.SetArgs([]string{"--version"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("--version: %v", err)
+	}
+	if out.String() != "vmrebalance 1.2.3\n" {
+		t.Errorf("output = %q", out.String())
+	}
+}
