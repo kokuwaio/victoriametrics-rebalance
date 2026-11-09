@@ -36,8 +36,6 @@ type VMCtl struct {
 	DstAddr string
 	// Concurrency is vmctl's number of import workers (--vm-concurrency). 0 keeps vmctl's default.
 	Concurrency int
-	// RateLimit caps the transfer in bytes per second (--vm-rate-limit). 0 means no limit.
-	RateLimit int64
 	// ExtraArgs are appended to the vmctl command line as they are.
 	ExtraArgs []string
 	// Run starts vmctl. Default: Exec.
@@ -49,8 +47,9 @@ type VMCtl struct {
 // outputTail is how much of vmctl's output is kept for parsing the stats and for error messages.
 const outputTail = 64 << 10
 
-// Copy runs vmctl once for the window and returns the bytes it reports.
-func (v *VMCtl) Copy(ctx context.Context, w migration.Window) (migration.CopyStats, error) {
+// Copy runs vmctl once for the window, capped at rateLimit bytes per second (0: no limit), and returns the bytes
+// it reports.
+func (v *VMCtl) Copy(ctx context.Context, w migration.Window, rateLimit int64) (migration.CopyStats, error) {
 	tail := &tailBuffer{max: outputTail}
 	out := io.Writer(tail)
 	if v.Output != nil {
@@ -60,7 +59,7 @@ func (v *VMCtl) Copy(ctx context.Context, w migration.Window) (migration.CopySta
 	if run == nil {
 		run = Exec
 	}
-	if err := run(ctx, v.binary(), v.args(w), out); err != nil {
+	if err := run(ctx, v.binary(), v.args(w, rateLimit), out); err != nil {
 		return migration.CopyStats{}, fmt.Errorf("vmctl: %w: %s", err, lastLines(tail.String(), 10))
 	}
 	return migration.CopyStats{Bytes: parseTotalBytes(tail.String())}, nil
@@ -73,7 +72,7 @@ func (v *VMCtl) binary() string {
 	return v.Binary
 }
 
-func (v *VMCtl) args(w migration.Window) []string {
+func (v *VMCtl) args(w migration.Window, rateLimit int64) []string {
 	args := []string{
 		"vm-native", "-s", "--disable-progress-bar",
 		"--vm-native-src-addr=" + v.SrcAddr,
@@ -85,8 +84,8 @@ func (v *VMCtl) args(w migration.Window) []string {
 	if v.Concurrency > 0 {
 		args = append(args, "--vm-concurrency="+strconv.Itoa(v.Concurrency))
 	}
-	if v.RateLimit > 0 {
-		args = append(args, "--vm-rate-limit="+strconv.FormatInt(v.RateLimit, 10))
+	if rateLimit > 0 {
+		args = append(args, "--vm-rate-limit="+strconv.FormatInt(rateLimit, 10))
 	}
 	return append(args, v.ExtraArgs...)
 }

@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
 	"time"
 
+	"github.com/VictoriaMetrics/metrics"
 	"github.com/spf13/cobra"
 
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/check"
@@ -28,6 +32,12 @@ type syncOptions struct {
 	rateLimit   string
 	srcURL      string
 	dstURL      string
+
+	adaptive       bool
+	minRateLimit   string
+	maxUtilization float64
+	maxQueryP99    time.Duration
+	metricsAddr    string
 
 	drain  check.DrainOptions
 	verify verifyFlags
@@ -62,7 +72,12 @@ writes, and verifies the days it copied.`,
 	f.StringVar(&o.vmctl, "vmctl", "vmctl", "path to the vmctl binary")
 	f.StringArrayVar(&o.vmctlArgs, "vmctl-arg", nil, "extra argument for vmctl, e.g. --vmctl-arg=--vm-native-disable-http-keep-alive (repeatable)")
 	f.IntVar(&o.concurrency, "concurrency", 2, "vmctl import workers (--vm-concurrency)")
-	f.StringVar(&o.rateLimit, "rate-limit", "", "transfer rate limit, e.g. 50MiB/s (default: none)")
+	f.StringVar(&o.rateLimit, "rate-limit", "", "transfer rate limit, e.g. 50MiB/s (default: none); with --adaptive the highest rate")
+	f.BoolVar(&o.adaptive, "adaptive", false, "lower the rate limit while blue's vmselect is busy, checked before every chunk (needs --rate-limit; use a small --step such as 1h)")
+	f.StringVar(&o.minRateLimit, "min-rate-limit", "", "with --adaptive: the lowest rate (default: a tenth of --rate-limit)")
+	f.Float64Var(&o.maxUtilization, "max-select-utilization", 0.8, "with --adaptive: share of blue's vmselect query slots in use above which blue counts as busy")
+	f.DurationVar(&o.maxQueryP99, "max-query-latency", 0, "with --adaptive: p99 latency of blue's queries above which blue counts as busy (default: ignore latency)")
+	f.StringVar(&o.metricsAddr, "metrics-addr", "", "serve the tool's Prometheus metrics on this address, e.g. :8080 (default: off)")
 	f.StringVar(&o.srcURL, "from-select-url", "", "blue's vmselect URL for vmctl, e.g. after a port-forward (default: the Service URL)")
 	f.StringVar(&o.dstURL, "to-insert-url", "", "green's vminsert URL for vmctl, e.g. after a port-forward (default: the Service URL)")
 	f.DurationVar(&o.drain.Timeout, "drain-timeout", 20*time.Minute, "with --final: how long blue may still receive writes after the final sync")
@@ -82,7 +97,17 @@ func runSync(cmd *cobra.Command, g *globalOptions, o *syncOptions) error {
 	if err != nil {
 		return err
 	}
-	syncer, err := newSyncer(cmd, e, o)
+	var m *migration.Metrics
+	if o.metricsAddr != "" {
+		set := metrics.NewSet()
+		m = migration.NewMetrics(set)
+		stop, err := serveMetrics(o.metricsAddr, set, e.log)
+		if err != nil {
+			return err
+		}
+		defer stop()
+	}
+	syncer, err := newSyncer(cmd, e, o, m)
 	if err != nil {
 		return err
 	}
@@ -120,7 +145,7 @@ func runSync(cmd *cobra.Command, g *globalOptions, o *syncOptions) error {
 	return nil
 }
 
-func newSyncer(cmd *cobra.Command, e *env, o *syncOptions) (*migration.Syncer, error) {
+func newSyncer(cmd *cobra.Command, e *env, o *syncOptions, m *migration.Metrics) (*migration.Syncer, error) {
 	rate, err := copier.ParseRate(o.rateLimit)
 	if err != nil {
 		return nil, err
@@ -135,16 +160,21 @@ func newSyncer(cmd *cobra.Command, e *env, o *syncOptions) (*migration.Syncer, e
 	if src == "" || dst == "" {
 		return nil, errors.New("blue needs a vmselect and green a vminsert")
 	}
+	pacer, err := newPacer(e, o, rate, m)
+	if err != nil {
+		return nil, err
+	}
 	return &migration.Syncer{
 		Copier: &copier.VMCtl{
 			Binary:      o.vmctl,
 			SrcAddr:     src + cluster.SelectPrefix(e.tenant),
 			DstAddr:     dst + cluster.InsertPrefix(e.tenant),
 			Concurrency: o.concurrency,
-			RateLimit:   rate,
 			ExtraArgs:   o.vmctlArgs,
 			Output:      cmd.ErrOrStderr(),
 		},
+		Pacer:   pacer,
+		Metrics: m,
 		Store:   e.store,
 		Step:    o.step,
 		Retries: o.retries,
@@ -153,6 +183,60 @@ func newSyncer(cmd *cobra.Command, e *env, o *syncOptions) (*migration.Syncer, e
 		Sleep:   sleep,
 		Log:     e.log,
 	}, nil
+}
+
+// newPacer returns a fixed rate, or with --adaptive a Governor that follows blue's vmselect load.
+func newPacer(e *env, o *syncOptions, rate int64, m *migration.Metrics) (migration.Pacer, error) {
+	if !o.adaptive {
+		return migration.FixedRate(rate), nil
+	}
+	if rate == 0 {
+		return nil, errors.New("--adaptive needs --rate-limit as the highest rate")
+	}
+	if o.maxUtilization <= 0 || o.maxUtilization > 1 {
+		return nil, errors.New("--max-select-utilization must be a share between 0 and 1, e.g. 0.8")
+	}
+	minRate, err := copier.ParseRate(o.minRateLimit)
+	if err != nil {
+		return nil, fmt.Errorf("--min-rate-limit: %w", err)
+	}
+	if minRate == 0 {
+		minRate = rate / 10
+	}
+	if minRate > rate {
+		return nil, errors.New("--min-rate-limit is above --rate-limit")
+	}
+	return &migration.Governor{
+		Read:           func(ctx context.Context) (migration.Load, error) { return check.SelectLoad(ctx, e.blue) },
+		Max:            rate,
+		Min:            minRate,
+		MaxUtilization: o.maxUtilization,
+		MaxQueryP99:    o.maxQueryP99,
+		Log:            e.log,
+		Metrics:        m,
+	}, nil
+}
+
+// serveMetrics serves the metrics in set, plus Go and process metrics, on addr until stop is called.
+func serveMetrics(addr string, set *metrics.Set, log *slog.Logger) (stop func(), err error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("--metrics-addr: %w", err)
+	}
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			set.WritePrometheus(w)
+			metrics.WriteProcessMetrics(w)
+		}),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("metrics server stopped", "err", err)
+		}
+	}()
+	log.Info("serving metrics", "addr", ln.Addr().String())
+	return func() { _ = srv.Close() }, nil
 }
 
 // runFinal runs the last sync after cutover, then the post-cutover checks.

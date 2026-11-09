@@ -4,17 +4,18 @@ go 1.27.3
 
 require (
 	github.com/VictoriaMetrics/VictoriaMetrics v1.154.1
+	github.com/VictoriaMetrics/metrics v1.44.1
 	github.com/VictoriaMetrics/operator/api v0.75.2
 	github.com/spf13/cobra v1.10.2
 	k8s.io/api v0.37.1
 	k8s.io/apimachinery v0.37.1
 	k8s.io/client-go v0.37.1
+	k8s.io/utils v0.0.0-20261023123148-ca04ba58ecab
 )
 
 require (
 	github.com/VictoriaMetrics/VictoriaLogs v1.51.1-0.20260624061259-dc94972a8708 // indirect
 	github.com/VictoriaMetrics/easyproto v1.2.0 // indirect
-	github.com/VictoriaMetrics/metrics v1.44.1 // indirect
 	github.com/VictoriaMetrics/metricsql v0.87.5 // indirect
 	github.com/alecthomas/units v0.0.0-20240927000941-0f3dac36c52b // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect
@@ -144,7 +145,6 @@ require (
 	k8s.io/autoscaler/vertical-pod-autoscaler v1.8.1 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20261007072838-e2e80c32a35f // indirect
-	k8s.io/utils v0.0.0-20261023123148-ca04ba58ecab // indirect
 	sigs.k8s.io/controller-runtime v0.25.2 // indirect
 	sigs.k8s.io/gateway-api v1.6.3 // indirect
 	sigs.k8s.io/json v0.0.0-20260909141634-11ed52e25bc5 // indirect

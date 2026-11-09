@@ -40,8 +40,17 @@ spec:
             - sync
             - --from=vmcluster
             - --to=vmcluster-b
-            - --rate-limit=50MiB/s
             - --concurrency=2
+            # Copy at up to 50MiB/s, and slow down while blue's vmselect is busy. The rate is adjusted between chunks,
+            # so use small chunks.
+            - --rate-limit=50MiB/s
+            - --adaptive
+            - --step=1h
+            - --metrics-addr=:8080
+          ports:
+            # The tool's own metrics (progress, rate limit, blue's load). Scrape them with a VMPodScrape.
+            - name: http-metrics
+              containerPort: 8080
           resources:
             requests:
               cpu: 500m

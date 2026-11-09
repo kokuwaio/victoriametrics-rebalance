@@ -94,17 +94,30 @@ func insertCounters(ctx context.Context, c cluster.Client, keep func(map[string]
 // named metric that keep accepts (nil keeps all).
 func scrape(ctx context.Context, c cluster.Client, comp cluster.Component, metric string,
 	keep func(map[string]string) bool) (map[string]float64, error) {
-	pods, err := cluster.RunningPods(ctx, c, comp)
+	samples, err := scrapeAll(ctx, c, comp)
 	if err != nil {
 		return nil, err
 	}
 	out := map[string]float64{}
+	for pod, s := range samples {
+		out[pod] = vm.Sum(s, metric, keep)
+	}
+	return out, nil
+}
+
+// scrapeAll reads /metrics from every running pod of a component and returns the samples per pod name.
+func scrapeAll(ctx context.Context, c cluster.Client, comp cluster.Component) (map[string][]vm.Sample, error) {
+	pods, err := cluster.RunningPods(ctx, c, comp)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string][]vm.Sample{}
 	for i := range pods {
 		body, err := c.PodGet(ctx, &pods[i], comp, "/metrics")
 		if err != nil {
 			return nil, fmt.Errorf("scrape %s: %w", pods[i].Name, err)
 		}
-		out[pods[i].Name] = vm.Sum(vm.ParseMetrics(body), metric, keep)
+		out[pods[i].Name] = vm.ParseMetrics(body)
 	}
 	return out, nil
 }

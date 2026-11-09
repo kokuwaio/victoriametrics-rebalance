@@ -1,9 +1,14 @@
 package migration_test
 
 import (
+	"bytes"
 	"context"
+	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/VictoriaMetrics/metrics"
 
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/migration"
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/state"
@@ -21,11 +26,13 @@ func ts(s string) time.Time {
 // window fails before it succeeds.
 type fakeCopier struct {
 	calls    []migration.Window
+	rates    []int64
 	failures map[migration.Window]int
 }
 
-func (f *fakeCopier) Copy(_ context.Context, w migration.Window) (migration.CopyStats, error) {
+func (f *fakeCopier) Copy(_ context.Context, w migration.Window, rateLimit int64) (migration.CopyStats, error) {
 	f.calls = append(f.calls, w)
+	f.rates = append(f.rates, rateLimit)
 	if f.failures[w] > 0 {
 		f.failures[w]--
 		return migration.CopyStats{}, errTransient
@@ -222,5 +229,68 @@ func TestSyncRejectsANonPositiveStep(t *testing.T) {
 
 	if err := s.Sync(t.Context(), ts("2026-01-01T00:00:00Z"), ts("2026-01-02T00:00:00Z")); err == nil {
 		t.Fatal("want an error for step 0 instead of an endless loop")
+	}
+}
+
+// pacer hands out the given rates in order.
+type pacer struct{ rates []int64 }
+
+func (p *pacer) Next(context.Context) int64 {
+	r := p.rates[0]
+	p.rates = p.rates[1:]
+	return r
+}
+
+func TestSyncCopiesEachChunkAtTheRateThePacerGives(t *testing.T) {
+	c := &fakeCopier{}
+	s := newSyncer(c, &state.Memory{}, ts("2026-01-03T06:00:00Z"))
+	s.Pacer = &pacer{rates: []int64{100, 50, 75}}
+
+	if err := s.Sync(t.Context(), ts("2026-01-01T00:00:00Z"), ts("2026-01-04T00:00:00Z")); err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.Equal(c.rates, []int64{100, 50, 75}) {
+		t.Errorf("rates = %v, want [100 50 75]", c.rates)
+	}
+}
+
+func TestSyncWithoutPacerCopiesUnlimited(t *testing.T) {
+	c := &fakeCopier{}
+	s := newSyncer(c, &state.Memory{}, ts("2026-01-03T06:00:00Z"))
+
+	if err := s.Sync(t.Context(), ts("2026-01-01T00:00:00Z"), ts("2026-01-02T00:00:00Z")); err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.Equal(c.rates, []int64{0}) {
+		t.Errorf("rates = %v, want [0]", c.rates)
+	}
+}
+
+func TestSyncMetricsShowTheRun(t *testing.T) {
+	retried := migration.Window{Start: ts("2026-01-02T00:00:00Z"), End: ts("2026-01-03T00:00:00Z")}
+	c := &fakeCopier{failures: map[migration.Window]int{retried: 1}}
+	s := newSyncer(c, &state.Memory{}, ts("2026-01-03T06:00:00Z"))
+	set := metrics.NewSet()
+	s.Metrics = migration.NewMetrics(set)
+	s.Pacer = &pacer{rates: []int64{100, 100, 75}}
+
+	if err := s.Sync(t.Context(), ts("2026-01-01T00:00:00Z"), ts("2026-01-04T00:00:00Z")); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	set.WritePrometheus(&out)
+	for _, line := range []string{
+		"vmrebalance_chunks_total 3",
+		"vmrebalance_copied_bytes_total 300",
+		"vmrebalance_chunk_retries_total 1",
+		"vmrebalance_synced_until_timestamp_seconds 1767484800",
+		"vmrebalance_rate_limit_bytes_per_second 75",
+	} {
+		if !strings.Contains(out.String(), line+"\n") {
+			t.Errorf("metrics lack %q:\n%s", line, out.String())
+		}
 	}
 }

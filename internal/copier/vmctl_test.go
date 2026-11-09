@@ -37,11 +37,10 @@ func TestCopyRunsVMCtlNativeModeForTheWindow(t *testing.T) {
 		SrcAddr:     "http://vmselect-blue.monitoring.svc:8481/select/0/prometheus",
 		DstAddr:     "http://vminsert-green.monitoring.svc:8480/insert/0/prometheus",
 		Concurrency: 2,
-		RateLimit:   50 << 20,
 		Run:         r.run,
 	}
 
-	if _, err := v.Copy(t.Context(), window); err != nil {
+	if _, err := v.Copy(t.Context(), window, 50<<20); err != nil {
 		t.Fatal(err)
 	}
 
@@ -60,11 +59,11 @@ func TestCopyRunsVMCtlNativeModeForTheWindow(t *testing.T) {
 	}
 }
 
-func TestCopyOmitsRateLimitWhenUnsetAndAppendsExtraArgs(t *testing.T) {
+func TestCopyOmitsRateLimitWhenUnlimitedAndAppendsExtraArgs(t *testing.T) {
 	r := &fakeRunner{}
 	v := &copier.VMCtl{Binary: "/bin/vmctl", SrcAddr: "s", DstAddr: "d", ExtraArgs: []string{"--vm-native-backoff-retries=5"}, Run: r.run}
 
-	if _, err := v.Copy(t.Context(), window); err != nil {
+	if _, err := v.Copy(t.Context(), window, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -84,7 +83,7 @@ func TestCopyReportsTheBytesVMCtlTransferred(t *testing.T) {
 		"  time spent while importing: 1m0s;\n  total bytes: 1.5 GB;\n  bytes/s: 25.0 MB;\n  requests: 10;\n"}
 	v := &copier.VMCtl{SrcAddr: "s", DstAddr: "d", Run: r.run}
 
-	stats, err := v.Copy(t.Context(), window)
+	stats, err := v.Copy(t.Context(), window, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +97,7 @@ func TestCopyFailureIncludesVMCtlOutput(t *testing.T) {
 	r := &fakeRunner{output: "error: cannot connect to vmselect\n", err: errors.New("exit status 1")}
 	v := &copier.VMCtl{SrcAddr: "s", DstAddr: "d", Run: r.run}
 
-	_, err := v.Copy(t.Context(), window)
+	_, err := v.Copy(t.Context(), window, 0)
 
 	if err == nil || !strings.Contains(err.Error(), "cannot connect to vmselect") {
 		t.Errorf("err = %v, want it to include vmctl's output", err)

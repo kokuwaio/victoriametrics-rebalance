@@ -32,6 +32,8 @@ type e2e struct {
 	ctx context.Context
 	cs  kubernetes.Interface
 	bin string
+	// jobLogs holds the logs of the last Job run by runJob.
+	jobLogs string
 }
 
 func TestMigration(t *testing.T) {
@@ -59,7 +61,11 @@ func TestMigration(t *testing.T) {
 
 	t.Run("sync as a Job", func(t *testing.T) {
 		e := e.on(t)
-		e.runJob("vmrebalance-sync", "sync", "--from=blue", "--to=green", "--retries=1", "--backoff=5s")
+		e.runJob("vmrebalance-sync", "sync", "--from=blue", "--to=green", "--retries=1", "--backoff=5s",
+			"--step=12h", "--adaptive", "--rate-limit=10MiB/s", "--metrics-addr=:8080")
+		if !strings.Contains(e.jobLogs, "serving metrics") {
+			t.Error("the sync Job didn't start its metrics server")
+		}
 		blue := e.query("blue", `sum(count_over_time(e2e_history[4d]))`, at)
 		green := e.query("green", `sum(count_over_time(e2e_history[4d]))`, at)
 		if blue == 0 || green != blue {
@@ -207,9 +213,11 @@ func (e *e2e) runJob(name string, args ...string) {
 		return j.Status.Succeeded > 0 || j.Status.Failed > 0
 	})
 	pods, _ := e.cs.CoreV1().Pods(ns).List(e.ctx, metav1.ListOptions{LabelSelector: "job-name=" + name})
+	e.jobLogs = ""
 	for _, p := range pods.Items {
 		logs, _ := e.cs.CoreV1().Pods(ns).GetLogs(p.Name, &corev1.PodLogOptions{}).DoRaw(e.ctx)
 		e.t.Logf("logs of %s:\n%s", p.Name, logs)
+		e.jobLogs += string(logs)
 	}
 	if done.Status.Succeeded == 0 {
 		e.t.Fatalf("Job %s failed", name)

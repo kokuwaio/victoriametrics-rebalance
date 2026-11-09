@@ -24,10 +24,21 @@ type CopyStats struct {
 	Bytes int64
 }
 
-// Copier copies all series in a window from blue to green.
+// Copier copies all series in a window from blue to green, at most rateLimit bytes per second (0: no limit).
 type Copier interface {
-	Copy(ctx context.Context, w Window) (CopyStats, error)
+	Copy(ctx context.Context, w Window, rateLimit int64) (CopyStats, error)
 }
+
+// Pacer decides the rate limit for the next chunk, in bytes per second (0: no limit).
+type Pacer interface {
+	Next(ctx context.Context) int64
+}
+
+// FixedRate is a Pacer that always returns the same rate.
+type FixedRate int64
+
+// Next returns the fixed rate.
+func (r FixedRate) Next(context.Context) int64 { return int64(r) }
 
 // Syncer copies time ranges chunk by chunk and records every finished chunk, so an interrupted run resumes at the
 // first unfinished one.
@@ -40,6 +51,10 @@ type Syncer struct {
 	Retries int
 	// Backoff is the wait before the first retry. It doubles with every further retry.
 	Backoff time.Duration
+	// Pacer sets each chunk's rate limit. Default: no limit.
+	Pacer Pacer
+	// Metrics records the progress. May be nil.
+	Metrics *Metrics
 
 	Now   func() time.Time
 	Sleep func(ctx context.Context, d time.Duration) error
@@ -113,8 +128,13 @@ func (s *Syncer) Final(ctx context.Context, cutover time.Time) (Window, error) {
 
 func (s *Syncer) copyRange(ctx context.Context, r Window) error {
 	for _, w := range Split(r, s.Step) {
+		var rate int64
+		if s.Pacer != nil {
+			rate = s.Pacer.Next(ctx)
+		}
+		s.Metrics.rate(rate)
 		began := s.Now()
-		stats, err := s.copyWithRetries(ctx, w)
+		stats, err := s.copyWithRetries(ctx, w, rate)
 		if err != nil {
 			return fmt.Errorf("copy %s: %w", w, err)
 		}
@@ -128,17 +148,19 @@ func (s *Syncer) copyRange(ctx context.Context, r Window) error {
 		if _, err := s.Store.Update(ctx, func(st *state.State) { st.AddChunk(c) }); err != nil {
 			return fmt.Errorf("save state after %s: %w", w, err)
 		}
+		s.Metrics.chunkDone(stats, c.Seconds, float64(w.End.Unix()))
 	}
 	return nil
 }
 
-func (s *Syncer) copyWithRetries(ctx context.Context, w Window) (CopyStats, error) {
+func (s *Syncer) copyWithRetries(ctx context.Context, w Window, rate int64) (CopyStats, error) {
 	wait := s.Backoff
 	for attempt := 0; ; attempt++ {
-		stats, err := s.Copier.Copy(ctx, w)
+		stats, err := s.Copier.Copy(ctx, w, rate)
 		if err == nil || attempt >= s.Retries || ctx.Err() != nil {
 			return stats, err
 		}
+		s.Metrics.retry()
 		s.log().Warn("chunk failed, retrying", "window", w.String(), "attempt", attempt+1, "wait", wait, "err", err)
 		if err := s.Sleep(ctx, wait); err != nil {
 			return CopyStats{}, err
@@ -147,12 +169,7 @@ func (s *Syncer) copyWithRetries(ctx context.Context, w Window) (CopyStats, erro
 	}
 }
 
-func (s *Syncer) log() *slog.Logger {
-	if s.Log == nil {
-		return slog.New(slog.DiscardHandler)
-	}
-	return s.Log
-}
+func (s *Syncer) log() *slog.Logger { return orDiscard(s.Log) }
 
 // Split cuts r into windows of at most step. Inner boundaries are aligned with time.Truncate, so a step of 24h
 // cuts at UTC midnight and one of 1h at full hours.
