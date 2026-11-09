@@ -25,6 +25,8 @@ objects for you.
 
 Documentation:
 
+- [docs/usage.md](docs/usage.md): a step-by-step migration with example manifests, how to watch the progress, all
+  flags, rollback and troubleshooting.
 - [docs/architecture.md](docs/architecture.md): how the tool works, with diagrams, design decisions, state, the
   adaptive rate limit and metrics.
 - [docs/roadmap.md](docs/roadmap.md): what's done, what's next and the open decisions.
@@ -95,6 +97,46 @@ state and would copy green's whole retention.
 6. **Name-agnostic monitoring.** Dashboards, alerts and SLOs that match `job="vmstorage-<name>"` exactly lose green.
    Use regexes or the instance label.
 
+## Install
+
+Releases exist for Linux and macOS on amd64 and arm64; on other platforms, [build from source](#build-from-source).
+
+### mise
+
+Install the release with [mise](https://mise.jdx.dev), which picks the archive for your OS and architecture and
+unpacks it:
+
+```sh
+mise use -g github:kokuwaio/victoriametrics-rebalance@latest
+```
+
+Upgrade with `mise upgrade github:kokuwaio/victoriametrics-rebalance`. mise skips releases younger than 24 hours by
+default (`minimum_release_age`). To install a new release right away, pin it, e.g.
+`mise use -g github:kokuwaio/victoriametrics-rebalance@0.1.0`.
+
+GitHub limits API requests without a token. If mise fails with a rate limit, or with `404 Not Found` while the
+repository is private, give it a token, for example the GitHub CLI's:
+
+```sh
+export MISE_GITHUB_TOKEN="$(gh auth token)"
+```
+
+`sync` also needs [vmctl](https://docs.victoriametrics.com/victoriametrics/vmctl/) in your `PATH` when it runs
+outside the container image. vmctl ships in the `vmutils` archives of the VictoriaMetrics releases.
+
+### Build from source
+
+```sh
+make build
+```
+
+This builds `./bin/vmrebalance` and needs the Go version from [go.mod](go.mod). `make help` lists the other targets.
+
+### Container image
+
+No image is published yet. `make image` builds one from the [Dockerfile](Dockerfile), with vmctl included, for
+running `sync` as a Job.
+
 ## Usage
 
 ```sh
@@ -105,33 +147,8 @@ vmrebalance status    --namespace monitoring --from vmcluster --to vmcluster-b
 vmrebalance sync      --namespace monitoring --from vmcluster --to vmcluster-b --final --cutover-at 2026-01-02T10:00:00Z
 ```
 
-Run `vmrebalance <command> --help` for all flags. The most important ones:
-
-- `sync --until now|<RFC 3339>`: copy up to this time (default: now).
-- `sync --since <RFC 3339>`: on the first run, start here instead of at now - retention (used for a rollback).
-- `sync --step 24h`: the chunk size. Every finished chunk is recorded, so a restarted run continues with the first
-  unfinished one.
-- `sync --rate-limit 50MiB/s --concurrency 2`: the export reads go through blue's vmselect and vmstorage and compete
-  with real queries. Start low and watch blue's load. The limit is the total: vmctl applies its rate limit per
-  request, and the tool runs one request per hour of the chunk on `--concurrency` workers, so it divides the limit
-  by the number of requests that run at once.
-- `sync --adaptive`: halve the rate while blue's vmselect is busy (queries wait for a slot, or most slots are in use),
-  and raise it again when it isn't. Latency counts only if you set `--max-query-latency`, e.g. `5s`; it is off by
-  default. The rate changes between chunks, so combine it with a small `--step`. See
-  [docs/architecture.md](docs/architecture.md#adaptive-rate-limit).
-- `sync --metrics-addr :8080`: serve the tool's Prometheus metrics (progress, rate limit, blue's load).
-- `sync --final --cutover-at <time>`: the time you switched the aliases. The final window is measured from it.
-  `--final-overlap` (default 1h) is how far before the last synced point the final window starts.
-  `--drain-interval` (default 5m) must be longer than the push interval of your slowest writer: blue passes only
-  when it receives no rows at all during one whole interval. It must also be at least 1m, because a send from
-  vminsert to a hung vmstorage node takes up to a minute to fail.
-- `--state-file state.json`: keep the state in a local file instead of the ConfigMap `vmrebalance.<from>.<to>`
-  (`vmrebalance.<from>.<to>.tenant-<tenant>` for tenants other than 0; each tenant has its own state).
-  This is fine on a workstation. A Job needs the ConfigMap, because its pod loses local files when it restarts.
-- `--access proxy|direct`: how the tool reaches vmselect and the pods. `proxy` goes through the Kubernetes API
-  server and works from any workstation, but the API server cuts requests off after its request timeout (1 minute
-  by default), which `verify` can hit on large clusters. `direct` uses Service DNS names and pod IPs. The default
-  (`auto`) picks `direct` inside a pod, `proxy` otherwise.
+[docs/usage.md](docs/usage.md) walks through every step, explains how to choose the rate limit and chunk size,
+and lists all flags. `vmrebalance <command> --help` shows them too.
 
 ### Where to run it
 
@@ -189,10 +206,18 @@ from a workstation without port-forwarding.
 ## Development
 
 ```sh
-go test ./...
-./test/e2e/run.sh
+make check
+make e2e
 ```
 
-The end-to-end test creates a kind cluster with its own kubeconfig (your current context stays untouched),
-installs the operator, two small VMClusters and a VMAgent writing to both, and runs a full migration. Set
-`KEEP_CLUSTER=1` to keep the cluster for another run.
+`make check` runs `go vet`, the unit tests with the race detector, and golangci-lint (if installed). `make e2e`
+creates a kind cluster with its own kubeconfig (your current context stays untouched), installs the operator, two
+small VMClusters and a VMAgent writing to both, and runs a full migration. It needs docker, kind, kubectl and helm.
+Set `KEEP_CLUSTER=1` to keep the cluster for another run. Pull requests run both.
+
+### Releasing
+
+Every push to `main` updates a draft release (Release Drafter, notes grouped by pull request label;
+`skip-changelog` hides a pull request). Publishing the draft creates the `vX.Y.Z` tag, which runs `make check` and
+builds the binaries for Linux and macOS (amd64, arm64) with GoReleaser and attaches them with a checksum file.
+`vmrebalance --version` prints the release version.
