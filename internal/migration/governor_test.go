@@ -1,10 +1,14 @@
 package migration_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/VictoriaMetrics/metrics"
 
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/migration"
 )
@@ -91,4 +95,23 @@ func TestGovernorNeverDropsToUnlimitedAndRecoversFromATinyRate(t *testing.T) {
 
 	// 0 would mean "no limit": halving must stop at 1 byte/s, and recovery must still move.
 	assertRates(t, g, []int64{2, 1, 1, 2, 3})
+}
+
+func TestGovernorMetricsShowBluesLoad(t *testing.T) {
+	g := governor([]reading{{load: migration.Load{Utilization: 0.25, QueryP99: 1500 * time.Millisecond}}})
+	set := metrics.NewSet()
+	g.Metrics = migration.NewMetrics(set)
+
+	g.Next(t.Context())
+
+	var out bytes.Buffer
+	set.WritePrometheus(&out)
+	for _, line := range []string{
+		"vmrebalance_blue_select_concurrency_ratio 0.25",
+		`vmrebalance_blue_query_duration_seconds{quantile="0.99"} 1.5`,
+	} {
+		if !strings.Contains(out.String(), line+"\n") {
+			t.Errorf("metrics lack %q:\n%s", line, out.String())
+		}
+	}
 }

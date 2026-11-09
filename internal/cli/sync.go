@@ -297,7 +297,7 @@ func runFinal(ctx context.Context, e *env, o *syncOptions, syncer *migration.Syn
 	// vminsert acknowledges rows before vmstorage makes them searchable. Reset the cache and verify only after that,
 	// so neither a cached result nor the count misses the last rows.
 	e.log.Info("waiting for green to make the imported rows searchable", "wait", importSettle)
-	if err := sleep(ctx, importSettle); err != nil {
+	if err := syncer.Sleep(ctx, importSettle); err != nil {
 		return err
 	}
 
