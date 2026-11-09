@@ -9,7 +9,8 @@ on:
 permissions:
   contents: read
 
-# Cancel outdated runs of a pull request.
+# Cancel outdated runs of a pull request, so the Dependabot auto-merge job of an older run doesn't merge a newer
+# commit whose checks haven't passed yet.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
@@ -66,3 +67,20 @@ jobs:
 
       - name: End-to-end test
         run: make e2e
+
+  # Merges Dependabot pull requests once all checks passed. Needs "Allow auto-merge" in the repository settings.
+  dependabot-auto-merge:
+    needs:
+      - check
+      - e2e
+    if: github.event_name == 'pull_request' && github.actor == 'dependabot[bot]'
+    permissions:
+      contents: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable auto-merge for Dependabot PRs
+        run: gh pr merge --auto --merge "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
