@@ -33,6 +33,12 @@ the new node's `partitions` directory, detach it on the old node and attach it o
 mechanism, and moving data between its nodes is unsafe because of the metricID collisions above, which is why this
 tool copies the data into a new cluster instead.
 
+This may change upstream. Since [#7599](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/7599), every
+vmstorage partition has its own index, so partitions are self-contained on disk. What's still missing is
+partition-dependent metricIDs, proposed in [#10792](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/10792)
+(open, no pull request yet). Once metricIDs can't collide across nodes, vmstorage partitions could be moved in place
+like VictoriaLogs ones, without a blue/green copy.
+
 See the VictoriaLogs docs on [rebalancing](https://docs.victoriametrics.com/victorialogs/cluster/#rebalancing) and
 the [partitions lifecycle](https://docs.victoriametrics.com/victorialogs/#partitions-lifecycle). VictoriaTraces has
 the [same endpoints](https://docs.victoriametrics.com/victoriatraces/#partitions-lifecycle).

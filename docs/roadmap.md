@@ -21,5 +21,9 @@
   `--apply`.
 - **Multi-tenancy.** The tool copies one tenant per run (`--tenant`). Copying all tenants (vmctl's
   `--vm-intercluster`) comes when someone needs it.
+- **Moving partitions in place.** If upstream makes metricIDs partition-dependent
+  ([#10792](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/10792)), vmstorage partitions could be moved
+  between nodes like VictoriaLogs partitions, which would be much faster than copying through vmctl. Then this tool
+  could offer that as a second engine, or no longer be needed.
 - **Default for `--adaptive`.** It is off, so the rate stays exactly as configured. Turn it on by default once
   milestone 1 has shown sensible thresholds.
