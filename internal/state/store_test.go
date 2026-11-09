@@ -2,6 +2,7 @@ package state_test
 
 import (
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -196,18 +197,39 @@ func TestEachTenantHasItsOwnState(t *testing.T) {
 	}
 }
 
-func TestAPartialPassDoesNotHideAFullDayResult(t *testing.T) {
-	s := &state.State{}
-	s.SetVerification(synced, state.DayResult{Pass: false, Problems: []string{"series: blue 10, green 9"}})
+func TestAPassReplacesOnlyResultsItCovers(t *testing.T) {
+	day := synced
+	at := func(h int) time.Time { return day.Add(time.Duration(h) * time.Hour) }
+	check := func(pass bool, from, until int) state.DayResult {
+		return state.DayResult{Pass: pass, From: at(from), Until: at(until), Partial: from != 0 || until != 24}
+	}
+	stored := func(s *state.State) state.DayResult { return s.Verifications[state.DayKey(day)] }
 
-	s.SetVerification(synced, state.DayResult{Pass: true, Partial: true})
-	if got := s.Verifications[state.DayKey(synced)]; got.Pass {
-		t.Errorf("a pass for 23:00–24:00 replaced the failed whole-day check: %+v", got)
+	s := &state.State{}
+	s.SetVerification(day, check(false, 0, 24))
+	s.SetVerification(day, check(true, 23, 24))
+	if stored(s).Pass {
+		t.Errorf("a pass for 23:00–24:00 replaced the failed whole-day check: %+v", stored(s))
 	}
 
-	s.SetVerification(synced, state.DayResult{Pass: true})
-	if got := s.Verifications[state.DayKey(synced)]; !got.Pass {
-		t.Errorf("a new whole-day pass must replace the failure: %+v", got)
+	s = &state.State{}
+	s.SetVerification(day, check(false, 0, 12))
+	s.SetVerification(day, check(true, 11, 13))
+	if stored(s).Pass {
+		t.Errorf("a pass for 11:00–13:00 replaced the failed 00:00–12:00 check: %+v", stored(s))
+	}
+	s.SetVerification(day, check(true, 0, 13))
+	if !stored(s).Pass {
+		t.Errorf("a pass for 00:00–13:00 covers the failed range and must replace it: %+v", stored(s))
+	}
+
+	s.SetVerification(day, check(false, 20, 22))
+	if stored(s).Pass {
+		t.Errorf("a failure must always be recorded: %+v", stored(s))
+	}
+	s.SetVerification(day, check(true, 0, 24))
+	if !stored(s).Pass {
+		t.Errorf("a whole-day pass must replace any result: %+v", stored(s))
 	}
 }
 
@@ -235,5 +257,32 @@ func TestStateNamesDontCollide(t *testing.T) {
 	d := state.Name(state.Migration{From: "blue", To: "green-x"})
 	if a == b || c == d {
 		t.Errorf("names collide: %s / %s, %s / %s", a, b, c, d)
+	}
+}
+
+func TestAFailureKeepsTheRangeOfAnEarlierFailure(t *testing.T) {
+	day := synced
+	at := func(h int) time.Time { return day.Add(time.Duration(h) * time.Hour) }
+	s := &state.State{}
+	s.SetVerification(day, state.DayResult{Pass: false, From: at(0), Until: at(24), Problems: []string{"samples of up: blue 10, green 9"}})
+	s.SetVerification(day, state.DayResult{Pass: false, From: at(20), Until: at(22), Problems: []string{"blue: timeout"}})
+	if got := s.Verifications[state.DayKey(day)].Problems; !slices.Contains(got, "samples of up: blue 10, green 9") {
+		t.Errorf("problems = %q, want the earlier one kept", got)
+	}
+
+	s.SetVerification(day, state.DayResult{Pass: true, From: at(20), Until: at(22)})
+
+	if got := s.Verifications[state.DayKey(day)]; got.Pass {
+		t.Errorf("a pass for 20:00–22:00 hid the earlier whole-day failure: %+v", got)
+	}
+}
+
+func TestAResultWithoutARangeCountsAsTheWholeDay(t *testing.T) {
+	s := &state.State{Verifications: map[string]state.DayResult{state.DayKey(synced): {Pass: false}}}
+
+	s.SetVerification(synced, state.DayResult{Pass: true, From: synced, Until: synced.Add(24 * time.Hour)})
+
+	if got := s.Verifications[state.DayKey(synced)]; !got.Pass {
+		t.Errorf("a whole-day pass must replace a failure saved without a range: %+v", got)
 	}
 }

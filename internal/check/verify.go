@@ -32,7 +32,7 @@ type VerifyOptions struct {
 // receiving writes after cutover.
 func VerifyDay(ctx context.Context, blue, green cluster.Client, start, end time.Time, o VerifyOptions) state.DayResult {
 	day := dayOf(start)
-	r := state.DayResult{Pass: true, CheckedAt: time.Now(), Partial: !IsFullDay(start, end)}
+	r := state.DayResult{Pass: true, CheckedAt: time.Now(), Partial: !IsFullDay(start, end), From: start, Until: end}
 	problem := func(format string, args ...any) {
 		r.Pass = false
 		r.Problems = append(r.Problems, fmt.Sprintf(format, args...))
@@ -55,15 +55,19 @@ func VerifyDay(ctx context.Context, blue, green cluster.Client, start, end time.
 		problem("series: blue %d, green %d", bs.TotalSeries, gs.TotalSeries)
 	}
 
-	window := end.Sub(start).Truncate(time.Second)
+	// A range selector at time t covers (t - window, t]. VictoriaMetrics stores timestamps in milliseconds, so a window
+	// of end - start in milliseconds, evaluated 1ms before end, covers exactly [start, end): a sample at start counts,
+	// one at end doesn't.
+	window := end.Sub(start).Milliseconds()
+	at := end.Add(-time.Millisecond)
 	for _, name := range sampleNames(bs.SeriesCountByMetricName, o) {
-		q := fmt.Sprintf("sum(count_over_time(%s[%ds]))", vm.MetricSelector(name), int64(window.Seconds()))
-		bc, err := vm.QuerySum(ctx, blue.SelectGet, q, end)
+		q := fmt.Sprintf("sum(count_over_time(%s[%dms]))", vm.MetricSelector(name), window)
+		bc, err := vm.QuerySum(ctx, blue.SelectGet, q, at)
 		if err != nil {
 			problem("blue: %v", err)
 			continue
 		}
-		gc, err := vm.QuerySum(ctx, green.SelectGet, q, end)
+		gc, err := vm.QuerySum(ctx, green.SelectGet, q, at)
 		if err != nil {
 			problem("green: %v", err)
 			continue

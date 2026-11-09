@@ -154,7 +154,7 @@ func pod(name, component string, phase corev1.PodPhase) corev1.Pod {
 	}
 }
 
-func TestPodsListsOnlyRunningPodsOfTheComponent(t *testing.T) {
+func TestPodsListsRunningPodsOfTheComponent(t *testing.T) {
 	terminating := pod("vmstorage-blue-2", "vmstorage", corev1.PodRunning)
 	now := metav1.NewTime(time.Now())
 	terminating.DeletionTimestamp = &now
@@ -173,8 +173,12 @@ func TestPodsListsOnlyRunningPodsOfTheComponent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(pods) != 1 || pods[0].Name != "vmstorage-blue-0" {
-		t.Errorf("pods = %v, want only the running one that isn't terminating", names(pods))
+	if got := names(pods); !slices.Equal(got, []string{"vmstorage-blue-0", "vmstorage-blue-2"}) {
+		t.Errorf("pods = %v, want the running ones, also the terminating one", got)
+	}
+	running, err := cluster.RunningPods(t.Context(), c, cluster.Storage)
+	if err != nil || !slices.Equal(names(running), []string{"vmstorage-blue-0"}) {
+		t.Errorf("RunningPods = %v, %v; want only the pod that isn't terminating", names(running), err)
 	}
 	var selector string
 	for _, r := range api.recorded() {

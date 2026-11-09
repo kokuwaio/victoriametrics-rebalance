@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/check"
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/cluster"
 )
@@ -183,5 +185,20 @@ func TestDrainFailsWhileSendsToAHungVMStorageNodeKeepFailing(t *testing.T) {
 
 	if res.Level != check.Fail || !strings.Contains(res.Message, "fail to send") {
 		t.Errorf("drain = %s %q, want a failure about failed sends", res.Level, res.Message)
+	}
+}
+
+func TestDrainDoesNotPassWhileAVMInsertPodTerminates(t *testing.T) {
+	blue := newCluster("blue", 2)
+	blue.setInserted([]int{1000, 1000, 1000, 1000, 1000, 1000}, []int{0, 0, 0, 0, 0, 0})
+	// A second vminsert is shutting down: it drops out of the scrapes, but may still be sending rows it accepted.
+	stopping := blue.addPod(cluster.Insert, "vminsert-blue-1", "v1.150.0", nil)
+	now := metav1.Now()
+	stopping.DeletionTimestamp = &now
+
+	res := check.WaitDrained(t.Context(), blue, drainOpts)
+
+	if res.Level != check.Fail || !strings.Contains(res.Message, "were terminating") {
+		t.Errorf("drain = %s %q, want an unknown result while a vminsert pod terminates", res.Level, res.Message)
 	}
 }

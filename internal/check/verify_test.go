@@ -128,9 +128,9 @@ func TestVerifyDayPassesWhenSeriesAndSampledCountsMatch(t *testing.T) {
 		t.Errorf("blue queried %v, green %v", queriedNames(b), names)
 	}
 	q := g.queries[0]
-	if !strings.Contains(q.Get("query"), "count_over_time") || !strings.Contains(q.Get("query"), "[86400s]") ||
-		q.Get("time") != "1767398400" || q.Get("nocache") != "1" || q.Get("deny_partial_response") != "1" {
-		t.Errorf("query = %v, want count_over_time over the day at its end, bypassing the cache, never partial", q)
+	if !strings.Contains(q.Get("query"), "count_over_time") || !strings.Contains(q.Get("query"), "[86400000ms]") ||
+		q.Get("time") != "1767398399.999" || q.Get("nocache") != "1" || q.Get("deny_partial_response") != "1" {
+		t.Errorf("query = %v, want count_over_time over [start, end), evaluated 1ms before the end, bypassing the cache, never partial", q)
 	}
 }
 
@@ -141,7 +141,7 @@ func TestVerifyDayPartialDayCountsUpToEnd(t *testing.T) {
 	check.VerifyDay(t.Context(), blue, green, day, day.Add(6*time.Hour), withRand())
 
 	q := g.queries[0]
-	if !strings.Contains(q.Get("query"), "[21600s]") || q.Get("time") != "1767333600" {
+	if !strings.Contains(q.Get("query"), "[21600000ms]") || q.Get("time") != "1767333599.999" {
 		t.Errorf("query = %v, want a 6h window ending at 06:00", q)
 	}
 }
@@ -203,7 +203,7 @@ func TestVerifyDayCountsOnlyFromStartWhenTheRangeBeginsMidDay(t *testing.T) {
 		t.Errorf("want pass, got %v", r.Problems)
 	}
 	q := g.queries[0]
-	if !strings.Contains(q.Get("query"), "[3600s]") || q.Get("time") != "1767358800" {
+	if !strings.Contains(q.Get("query"), "[3600000ms]") || q.Get("time") != "1767358799.999" {
 		t.Errorf("query = %v, want a 1h window ending at 13:00", q)
 	}
 }

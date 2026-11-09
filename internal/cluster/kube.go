@@ -80,7 +80,7 @@ func (c *kubeCluster) Pods(ctx context.Context, comp Component) ([]corev1.Pod, e
 	}
 	var out []corev1.Pod
 	for _, p := range list.Items {
-		if p.Status.Phase == corev1.PodRunning && p.DeletionTimestamp == nil {
+		if p.Status.Phase == corev1.PodRunning {
 			out = append(out, p)
 		}
 	}

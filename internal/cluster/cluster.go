@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"slices"
 
 	vmv1beta1 "github.com/VictoriaMetrics/operator/api/operator/v1beta1"
 	corev1 "k8s.io/api/core/v1"
@@ -97,7 +98,7 @@ func InsertPrefix(tenant string) string { return "/insert/" + tenant + "/prometh
 // Client is everything the checks need from one cluster.
 type Client interface {
 	Info() Info
-	// Pods lists the running pods of a component.
+	// Pods lists the running pods of a component, including ones that are terminating.
 	Pods(ctx context.Context, c Component) ([]corev1.Pod, error)
 	// PodGet sends GET path to one pod of component c, on the component's HTTP port.
 	PodGet(ctx context.Context, pod *corev1.Pod, c Component, path string) ([]byte, error)
@@ -122,14 +123,19 @@ func ResetRollupCache(ctx context.Context, c Client) error {
 	return nil
 }
 
-// RunningPods returns the running pods of a component, or an error if there are none.
+// RunningPods returns the running pods of a component that aren't terminating, or an error if there are none.
 func RunningPods(ctx context.Context, c Client, comp Component) ([]corev1.Pod, error) {
 	pods, err := c.Pods(ctx, comp)
 	if err != nil {
 		return nil, err
 	}
+	// Copy: DeleteFunc works in place, and the slice belongs to the Client.
+	pods = slices.DeleteFunc(slices.Clone(pods), Terminating)
 	if len(pods) == 0 {
 		return nil, fmt.Errorf("%s has no running %s pods", c.Info().Name, comp)
 	}
 	return pods, nil
 }
+
+// Terminating reports whether a pod is shutting down. A terminating vminsert may still be sending rows it accepted.
+func Terminating(p corev1.Pod) bool { return p.DeletionTimestamp != nil }

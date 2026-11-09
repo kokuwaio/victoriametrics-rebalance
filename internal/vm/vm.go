@@ -150,12 +150,12 @@ func TSDB(ctx context.Context, get Getter, day time.Time, topN int) (TSDBStatus,
 	return resp.Data, nil
 }
 
-// QuerySum runs an instant query at t, bypassing the rollup cache, and returns the sum of all result values
+// QuerySum runs an instant query at t (millisecond precision), bypassing the rollup cache, and returns the sum of all result values
 // (0 for an empty result). It fails instead of returning a partial result when a vmstorage node is unavailable.
 func QuerySum(ctx context.Context, get Getter, query string, t time.Time) (float64, error) {
 	q := url.Values{
 		"query":                 {query},
-		"time":                  {strconv.FormatInt(t.Unix(), 10)},
+		"time":                  {strconv.FormatFloat(float64(t.UnixMilli())/1000, 'f', 3, 64)},
 		"nocache":               {"1"},
 		"deny_partial_response": {"1"},
 	}

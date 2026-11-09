@@ -67,8 +67,9 @@ func WaitDrained(ctx context.Context, blue cluster.Client, o DrainOptions) Resul
 	}
 	if lastWrites == 0 {
 		return Result{Name: Drain, Level: Fail, Message: fmt.Sprintf(
-			"blue's vminsert pods restarted or changed during every measurement within %s, so it is unknown whether "+
-				"blue still receives writes; wait until they are stable", o.Timeout)}
+			"blue's vminsert pods restarted, changed or were terminating during every measurement within %s, so it "+
+				"is unknown whether blue still receives writes; wait until they are stable (a pod stuck terminating "+
+				"must be deleted)", o.Timeout)}
 	}
 	return Result{Name: Drain, Level: Fail, Message: fmt.Sprintf(
 		"blue still received %.0f rows/s within %s: some writer still points at blue; point it at green",

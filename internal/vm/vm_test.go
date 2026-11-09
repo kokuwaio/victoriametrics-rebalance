@@ -100,7 +100,7 @@ func TestQuerySumAddsUpAllSeries(t *testing.T) {
 	if err != nil || sum != 15.5 {
 		t.Fatalf("QuerySum = %v, %v", sum, err)
 	}
-	if *path != "api/v1/query" || q.Get("query") != "count_over_time(up[1d])" || q.Get("time") != "1767366000" ||
+	if *path != "api/v1/query" || q.Get("query") != "count_over_time(up[1d])" || q.Get("time") != "1767366000.000" ||
 		q.Get("nocache") != "1" || q.Get("deny_partial_response") != "1" {
 		t.Errorf("request = %s %v", *path, *q)
 	}
@@ -157,5 +157,17 @@ func TestMetricSelectorQuotesTheName(t *testing.T) {
 		if got := vm.MetricSelector(name); got != want {
 			t.Errorf("MetricSelector(%q) = %s, want %s", name, got, want)
 		}
+	}
+}
+
+func TestQuerySumKeepsMilliseconds(t *testing.T) {
+	get, q, _ := getter(`{"status":"success","data":{"resultType":"vector","result":[]}}`, nil)
+
+	if _, err := vm.QuerySum(t.Context(), get, "up", day.Add(-time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+
+	if q.Get("time") != "1767365999.999" {
+		t.Errorf("time = %s, want the evaluation time with millisecond precision", q.Get("time"))
 	}
 }

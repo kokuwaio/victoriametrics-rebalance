@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"slices"
 	"sync"
 	"time"
 )
@@ -62,6 +63,14 @@ type DayResult struct {
 	CheckedAt   time.Time `json:"checkedAt"`
 	// Partial is true when only part of the day was checked (sample counts only, no series count).
 	Partial bool `json:"partial,omitempty"`
+	// From and Until are the time range [From, Until) that was checked.
+	From  time.Time `json:"from,omitzero"`
+	Until time.Time `json:"until,omitzero"`
+}
+
+// covers reports whether r checked at least the time range old checked.
+func (r DayResult) covers(old DayResult) bool {
+	return !r.From.After(old.From) && !r.Until.Before(old.Until)
 }
 
 // AddChunk appends a finished chunk, moves SyncedUntil forward and trims the history to MaxChunks.
@@ -75,16 +84,48 @@ func (s *State) AddChunk(c Chunk) {
 	}
 }
 
-// SetVerification stores the result for the day that starts at day (UTC). A passing check of only part of the day
-// doesn't replace a result for the whole day, which also compared the series count.
+// SetVerification stores the result for the day that starts at day (UTC). A pass replaces an earlier result only if
+// it checked at least the same time range, so a pass for part of the day neither hides a failure elsewhere in the day
+// nor a whole-day result, which also compared the series count. A failure is always stored; after an earlier
+// failure, its range grows to cover both, so a later pass of only the new range can't hide the earlier one.
 func (s *State) SetVerification(day time.Time, r DayResult) {
 	if s.Verifications == nil {
 		s.Verifications = map[string]DayResult{}
 	}
-	if old, ok := s.Verifications[DayKey(day)]; ok && !old.Partial && r.Partial && r.Pass {
-		return
+	key := DayKey(day)
+	if old, ok := s.Verifications[key]; ok {
+		if old.From.IsZero() && old.Until.IsZero() {
+			// Saved without a range: it checked the whole day.
+			old.From = day.UTC().Truncate(24 * time.Hour)
+			old.Until = old.From.Add(24 * time.Hour)
+		}
+		switch {
+		case r.Pass && !r.covers(old):
+			return
+		case !r.Pass && !old.Pass:
+			r.From, r.Until = minTime(r.From, old.From), maxTime(r.Until, old.Until)
+			for _, p := range old.Problems {
+				if !slices.Contains(r.Problems, p) {
+					r.Problems = append(r.Problems, p)
+				}
+			}
+		}
 	}
-	s.Verifications[DayKey(day)] = r
+	s.Verifications[key] = r
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 // DayKey formats the UTC day of t as YYYY-MM-DD.

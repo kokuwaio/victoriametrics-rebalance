@@ -330,8 +330,9 @@ func runFinal(ctx context.Context, e *env, o *syncOptions, syncer *migration.Syn
 const importSettle = 30 * time.Second
 
 // earlierFailures reports days in the migrated range (the first full day after the backfill start up to the last
-// synced point) whose stored verify result failed, except those this run already reports as failed. A pass of only
-// part of a day keeps an earlier whole-day failure, so such a day shows up here until a whole-day verify passes.
+// synced point) whose stored verify result failed, except those this run already reports as failed. A pass that
+// didn't cover the failed time range keeps the failure (see state.SetVerification), so such a day shows up here
+// until a verify of at least that range passes.
 // Days outside the range, such as the partly copied day the backfill started on, don't count.
 func earlierFailures(st *state.State, thisRun []check.Result) check.Result {
 	reported := map[string]bool{}
@@ -353,7 +354,7 @@ func earlierFailures(st *state.State, thisRun []check.Result) check.Result {
 	}
 	slices.Sort(days)
 	return check.Result{Name: "earlier verify", Level: check.Fail, Message: fmt.Sprintf(
-		"these days failed verify and haven't passed a whole-day verify since: %s; verify them again, and if green "+
+		"these days failed verify and no later verify of that time range passed: %s; verify them again, and if green "+
 			"really misses data there, copy those days again (a sync with its own --state-file, --since and --until)",
 		strings.Join(days, ", "))}
 }

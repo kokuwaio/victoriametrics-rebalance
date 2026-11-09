@@ -68,16 +68,22 @@ type Sleeper func(ctx context.Context, d time.Duration) error
 // vm_rows_inserted_total window apart. keep filters the counters by their labels (nil keeps all). It also reports
 // what the pods still have to deliver to vmstorage, see ingestion.
 //
-// Pods that restarted between the scrapes (another vm_app_start_timestamp, or the counter went down) or appeared or
-// vanished in between are left out of the rate, and complete is false: what those pods received is unknown, so a
-// rate of 0 doesn't prove there were no writes.
+// Pods that restarted between the scrapes (another vm_app_start_timestamp, or the counter went down), appeared or
+// vanished in between, or were terminating are left out of the rate, and complete is false: what those pods
+// received or still send is unknown, so a rate of 0 doesn't prove there were no writes.
 func insertRate(ctx context.Context, c cluster.Client, window time.Duration, sleep Sleeper,
 	keep func(map[string]string) bool) (ingestion, error) {
 	type reading struct {
 		rows, started, pending, sent, sendErrors float64
 		unreachable                              bool
 	}
+	terminating := false // a vminsert pod shut down during the window, so its last rows weren't measured
 	read := func() (map[string]reading, error) {
+		pods, err := c.Pods(ctx, cluster.Insert)
+		if err != nil {
+			return nil, err
+		}
+		terminating = terminating || slices.ContainsFunc(pods, cluster.Terminating)
 		samples, err := scrapeAll(ctx, c, cluster.Insert)
 		if err != nil {
 			return nil, err
@@ -107,7 +113,7 @@ func insertRate(ctx context.Context, c cluster.Client, window time.Duration, sle
 		return ingestion{}, err
 	}
 	var rows float64
-	in := ingestion{complete: len(before) == len(after)}
+	in := ingestion{complete: len(before) == len(after) && !terminating}
 	for pod, a := range after {
 		b, ok := before[pod]
 		in.pending += a.pending
@@ -128,7 +134,7 @@ func insertRate(ctx context.Context, c cluster.Client, window time.Duration, sle
 type ingestion struct {
 	// rate is the rows per second the vminsert pods accepted.
 	rate float64
-	// complete is false when a pod restarted, appeared or vanished during the window.
+	// complete is false when a pod restarted, appeared, vanished or was terminating during the window.
 	complete bool
 	// pending is the rows the vminsert pods buffer for vmstorage at the end of the window.
 	pending float64
