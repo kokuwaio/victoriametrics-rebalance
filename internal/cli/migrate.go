@@ -192,6 +192,12 @@ func (m *migrator) run(ctx context.Context) error {
 			}
 		}
 		m.phase.Set(migration.PhaseFinal)
+		// Verify (and copy again) the earlier days without a whole-day pass first: one may have failed to query, or
+		// failed before a restart. The final sync then resets green's rollup cache after those copies, and its check
+		// of earlier failures sees the repaired days.
+		if err := m.verifyEveryDay(ctx, syncer); err != nil {
+			return err
+		}
 		m.e.log.Info("running the final sync", "cutover", cutover.UTC().Format(time.RFC3339))
 		results, err := finalSync(ctx, m.e, &m.o.sync, syncer, cutover)
 		if errors.Is(err, errNotDrained) {
@@ -214,11 +220,12 @@ func (m *migrator) run(ctx context.Context) error {
 		}
 		break
 	}
-	// The final checks passed, but they cover only the final window: make sure every earlier day passed a whole-day
-	// verify (one may have failed to query), then that neither VMCluster was created again meanwhile.
-	if err := m.verifyEveryDay(ctx, syncer); err != nil {
+	// The final sync can make the cutover day a full one (when its window crossed midnight). Verify it as a whole
+	// too, and reset the rollup cache again if that copied anything, since readers use green by now.
+	if err := m.verifyNewlyFullDays(ctx, syncer); err != nil {
 		return err
 	}
+	// Make sure neither VMCluster was created again meanwhile.
 	if err := m.waitForClusters(ctx); err != nil {
 		return err
 	}
@@ -536,3 +543,19 @@ func (m *migrator) verifyEveryDay(ctx context.Context, syncer *migration.Syncer)
 
 // verifyAttempts is how often the final verify of the days without a whole-day pass runs before migrate gives up.
 const verifyAttempts = 10
+
+// verifyNewlyFullDays runs verifyEveryDay after the final sync when a day still lacks a whole-day pass, then resets
+// green's rollup cache again, since that verify may have copied the day again and readers use green by now.
+func (m *migrator) verifyNewlyFullDays(ctx context.Context, syncer *migration.Syncer) error {
+	st, err := m.e.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	if len(unverifiedDays(st)) == 0 {
+		return nil
+	}
+	if err := m.verifyEveryDay(ctx, syncer); err != nil {
+		return err
+	}
+	return cluster.ResetRollupCache(ctx, m.e.green)
+}

@@ -506,6 +506,36 @@ func TestMigrateVerifiesEveryDayBeforeItCompletes(t *testing.T) {
 	}
 }
 
+func TestMigrateRepairsEarlierDaysBeforeTheFinalSync(t *testing.T) {
+	tc := newMigrateTest(t)
+	// A resumed final sync. 2026-01-03 failed verify before; its cause is fixed now, but green still misses data
+	// on 2026-01-04 until that day is copied again.
+	if _, err := tc.e.store.Update(t.Context(), func(s *state.State) {
+		s.BackfillStart, s.SyncedUntil = ts("2026-01-02T10:00:00Z"), ts("2026-01-05T08:50:00Z")
+		s.CutoverAt = ts("2026-01-05T09:00:00Z")
+		s.Verifications = map[string]state.DayResult{"2026-01-03": {Pass: false, Problems: []string{"up: green 50"}}}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tc.green.samples = 50
+	resetsAtRepair := -1
+	tc.copier.onCopy = func(w migration.Window) {
+		if w.Start.Equal(ts("2026-01-03T00:00:00Z")) || w.Start.Equal(ts("2026-01-04T00:00:00Z")) {
+			tc.green.samples = 100
+			resetsAtRepair = strings.Count(strings.Join(tc.green.podGets, " "), "resetRollupResultCache")
+		}
+	}
+
+	if err := tc.m.run(t.Context()); err != nil {
+		t.Fatalf("run: %v\n%s", err, tc.out)
+	}
+
+	// Readers use green already, so the cache reset must come after the repair, or it serves the old results.
+	if resets := strings.Count(strings.Join(tc.green.podGets, " "), "resetRollupResultCache"); resetsAtRepair < 0 || resets <= resetsAtRepair {
+		t.Errorf("rollup cache reset %d times, %d of them before the repair; want one after it", resets, resetsAtRepair)
+	}
+}
+
 func TestMigrateResumesTheFinalSyncOfARecordedCutover(t *testing.T) {
 	tc := newMigrateTest(t)
 	cutover := ts("2026-01-05T09:00:00Z")
