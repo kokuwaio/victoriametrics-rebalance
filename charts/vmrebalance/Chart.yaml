@@ -12,6 +12,6 @@ keywords:
   - rebalance
   - migration
 # The chart version. Bump it with every change to the chart.
-version: 0.2.0
+version: 0.2.1
 # The vmrebalance release the chart runs by default (image tag v<appVersion>).
 appVersion: "0.2.0"
