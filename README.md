@@ -193,7 +193,10 @@ vmrebalance status    --namespace monitoring --from vmcluster --to vmcluster-b
 vmrebalance verify    --namespace monitoring --from vmcluster --to vmcluster-b
 ```
 
-`sync` copies a time range outside a migration, for example back to blue after a rollback:
+`sync` copies a time range outside a migration, for example back to blue after a rollback. Set `--since` to a time
+before the switch (Ready in `status`, if you switched after it), not the cutover, and give blue
+`dedup.minScrapeInterval: 1ms` first, since the copy overlaps what blue already has (see
+[Rolling back](docs/usage.md#rolling-back)):
 
 ```sh
 vmrebalance sync      --namespace monitoring --from vmcluster-b --to vmcluster --since 2026-01-09T10:00:00Z
