@@ -64,10 +64,11 @@ fullnameOverride: ""
 image:
   pullPolicy: IfNotPresent
   repository: ghcr.io/kokuwaio/victoriametrics-rebalance
-  # -- Image tag. Defaults to v<appVersion>. Until the first release is published, set it to "main".
+  # -- Image tag. Defaults to v<appVersion>; "main" runs the latest commit on the main branch.
   tag: ""
 
-# -- Secrets for pulling the image, e.g. [{name: ghcr}].
+# -- Secrets for pulling the image, e.g. [{name: registry}]. The image on ghcr.io is public; set this only for a
+# private registry or mirror.
 imagePullSecrets: []
 
 job:

@@ -136,10 +136,10 @@ mise use -g github:kokuwaio/victoriametrics-rebalance@latest
 
 Upgrade with `mise upgrade github:kokuwaio/victoriametrics-rebalance`. mise skips releases younger than 24 hours by
 default (`minimum_release_age`). To install a new release right away, pin it, e.g.
-`mise use -g github:kokuwaio/victoriametrics-rebalance@0.1.0`.
+`mise use -g github:kokuwaio/victoriametrics-rebalance@0.2.0`.
 
-GitHub limits API requests without a token. If mise fails with a rate limit, or with `404 Not Found` while the
-repository is private, give it a token, for example the GitHub CLI's:
+GitHub limits API requests without a token. If mise fails with a rate limit, give it a token, for example the
+GitHub CLI's:
 
 ```sh
 export MISE_GITHUB_TOKEN="$(gh auth token)"
@@ -159,10 +159,9 @@ This builds `./bin/vmrebalance` and needs the Go version from [go.mod](go.mod). 
 ### Container image
 
 The release workflow publishes `ghcr.io/kokuwaio/victoriametrics-rebalance` for linux/amd64 and linux/arm64,
-with vmctl included, for running `sync` as a Job. Tags: `vX.Y.Z`, `vX.Y`, `vX` (from 1.0 on) and `latest` for
-releases, and `main` for the latest commit on the main branch. GitHub creates the package as private: until it is
-made public in its package settings, the cluster needs an image pull secret for `ghcr.io`. `make image` builds the
-same image locally.
+with vmctl included, for running `migrate` as a Job. Tags: `vX.Y.Z`, `vX.Y`, `vX` (from 1.0 on) and `latest` for
+releases, and `main` for the latest commit on the main branch. The image is public, so pulling it needs no secret.
+`make image` builds the same image locally.
 
 ### Helm chart
 

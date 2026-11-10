@@ -28,8 +28,8 @@ cutover take minutes. Plan a few days of soak time before you delete blue.
 
 The migration runs as a Job in the cluster, installed with the [Helm chart](../README.md#helm-chart), because vmctl
 needs network access to blue's vmselect and green's vminsert. The Job uses the image
-`ghcr.io/kokuwaio/victoriametrics-rebalance`, which bundles vmctl. The cluster needs an image pull secret for
-`ghcr.io` (the chart value `imagePullSecrets`) until the package is made public.
+`ghcr.io/kokuwaio/victoriametrics-rebalance`, which bundles vmctl. The image and the chart are public, so the
+cluster needs no pull secret.
 
 To look at a migration from a workstation (`preflight`, `verify`, `status`), install the binary with mise or build
 it, see [Install](../README.md#install). It uses your kubeconfig (`--kubeconfig`, `--context`), and needs read
