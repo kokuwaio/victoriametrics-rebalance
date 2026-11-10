@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs the end-to-end test on a local kind cluster: two small VMClusters, a VMAgent writing to both, and
-# vmrebalance running locally (preflight, verify, status) and as a Job from the Helm chart (sync, sync --final).
+# vmrebalance running locally (preflight, verify, status) and as a Job from the Helm chart (migrate).
 #
 # Needs docker, kind, helm, kubectl and go. The cluster gets its own kubeconfig file, so your current context
 # stays untouched. Set KEEP_CLUSTER=1 to keep the cluster afterwards (the next run reuses it).

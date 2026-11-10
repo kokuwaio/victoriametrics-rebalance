@@ -124,7 +124,7 @@ func TestConfigMapStoreRoundTrip(t *testing.T) {
 }
 
 func TestConfigMapStoreUpdateKeepsAConcurrentWritersChanges(t *testing.T) {
-	// Another run (say, verify during a sync Job) records a verification between our read and our write.
+	// Another run (say, verify during a migrate Job) records a verification between our read and our write.
 	cs := apiServerWithInterleave(func(cm *corev1.ConfigMap) {
 		cm.Data["state.json"] = `{"from":"blue","to":"green","verifications":{"2026-01-01":{"pass":true,"blueSeries":1,"greenSeries":1,"checkedAt":"2026-01-02T00:00:00Z"}}}`
 	})

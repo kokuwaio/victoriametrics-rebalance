@@ -17,11 +17,13 @@ import (
 // fakeCluster is a cluster.Client with one pod per component. vmselect reports series series for every day and
 // samples samples for the metric "up"; each vminsert scrape returns the next body of inserts (the last repeats).
 type fakeCluster struct {
-	name    string
-	series  int64
-	samples float64
-	inserts []string
-	podGets []string
+	name      string
+	series    int64
+	samples   float64
+	inserts   []string
+	podGets   []string
+	podsErr   error // returned by Pods when set
+	selectErr error // returned by SelectGet when set
 }
 
 func newFake(name string) *fakeCluster {
@@ -40,7 +42,13 @@ func (f *fakeCluster) Info() cluster.Info {
 }
 
 func (f *fakeCluster) Pods(_ context.Context, c cluster.Component) ([]corev1.Pod, error) {
-	return []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: string(c) + "-" + f.name + "-0", Namespace: "monitoring"}}}, nil
+	if f.podsErr != nil {
+		return nil, f.podsErr
+	}
+	return []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{
+		Name: string(c) + "-" + f.name + "-0", Namespace: "monitoring",
+		Labels: map[string]string{"app.kubernetes.io/name": string(c), "app.kubernetes.io/instance": f.name},
+	}}}, nil
 }
 
 func (f *fakeCluster) PodGet(_ context.Context, pod *corev1.Pod, _ cluster.Component, path string) ([]byte, error) {
@@ -59,6 +67,9 @@ func (f *fakeCluster) PodGet(_ context.Context, pod *corev1.Pod, _ cluster.Compo
 }
 
 func (f *fakeCluster) SelectGet(_ context.Context, path string, _ url.Values) ([]byte, error) {
+	if f.selectErr != nil {
+		return nil, f.selectErr
+	}
 	var data any
 	switch path {
 	case "api/v1/status/tsdb":

@@ -1,8 +1,9 @@
 # Architecture
 
-`vmrebalance` is one Go binary with four commands (`preflight`, `sync`, `verify`, `status`). It runs on a
-workstation or as a Kubernetes Job. It reads the two VMCluster objects through the Kubernetes API, talks to
-vmselect, vminsert and the pods over HTTP, and copies data by running
+`vmrebalance` is one Go binary. `migrate` runs a whole migration, usually as a Kubernetes Job from the Helm chart.
+`preflight`, `verify` and `status` look at a migration from a workstation, and `sync` copies a time range outside a
+migration (for example back to blue after a rollback). It reads the two VMCluster objects through the Kubernetes API,
+talks to vmselect, vminsert and the pods over HTTP, and copies data by running
 [vmctl](https://docs.victoriametrics.com/victoriametrics/vmctl/) once per chunk.
 
 It never changes VMCluster, VMAgent or Service objects and never deletes data. The only object it writes is its
@@ -17,8 +18,9 @@ the tool works and why it is built this way.
   [#10792](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/10792)). Writing everything again through
   green's vminsert lets VictoriaMetrics itself spread the series across the new set of nodes.
 - **The tool doesn't change Kubernetes objects.** In most setups a GitOps repository owns the VMCluster, VMAgent and
-  Service objects. The tool says when each change is due and checks that it took effect. An `--apply` mode for
-  setups without GitOps is on the [roadmap](roadmap.md).
+  Service objects, and would revert changes made in the cluster. So creating green, enabling dual write, the cutover
+  and deleting blue stay your changes. The tool says when each change is due and checks that it took effect;
+  `migrate` waits for them and notices the cutover by itself.
 - **vmctl as the copy engine.** Each chunk is one `vmctl vm-native` run: `GET /api/v1/export/native` on blue's
   vmselect, streamed into `POST /api/v1/import/native` on green's vminsert, one request per hour of the chunk,
   spread over `--concurrency` workers. The tool turns off vmctl's per-metric mode: that mode first lists metric names
@@ -42,7 +44,7 @@ the tool works and why it is built this way.
   a ConfigMap costs nothing extra and survives restarts of a Job's pod.
 - **One tenant per run.** The tool copies the tenant in `--tenant` (default `0`), through
   `/select/<tenant>/prometheus` on blue and `/insert/<tenant>/prometheus` on green. Copying all tenants at once
-  (vmctl's `--vm-intercluster`) is on the [roadmap](roadmap.md).
+  (vmctl's `--vm-intercluster`) isn't supported; run one migration per tenant.
 
 ## System context
 
@@ -123,7 +125,7 @@ flowchart TD
 | `internal/cli` | Cobra commands and flags. It connects to Kubernetes, opens both clusters and the state, wires the other packages together and prints the reports. It holds no migration logic. |
 | `internal/migration` | `Syncer` splits a time range into step-aligned chunks, copies them in order with retries, and records each finished chunk. It also runs the final sync window. `Governor` picks each chunk's rate limit. `Metrics` holds the tool's own Prometheus metrics. |
 | `internal/copier` | `VMCtl` implements `migration.Copier`. It builds the `vmctl vm-native` command line for a window and rate, and reads the transferred bytes from vmctl's output. |
-| `internal/check` | Read-only checks over `cluster.Client`: `Preflight`, `VerifyDay`, `WaitDrained` (blue gets no more writes), and `SelectLoad` (blue's vmselect load, which the Governor reads). They scrape each pod's `/metrics` directly, so they don't depend on self-monitoring being set up. |
+| `internal/check` | Read-only checks over `cluster.Client`: `Preflight`, `VerifyDay`, `WaitDrained` (blue gets no more writes), `WatchWrites` (have the writers switched to green?), and `SelectLoad` (blue's vmselect load, which the Governor reads). They scrape each pod's `/metrics` directly, so they don't depend on self-monitoring being set up. |
 | `internal/cluster` | `Client` is everything the checks need from one cluster: facts from the VMCluster spec, running pods, GET on a pod, GET on vmselect, PodDisruptionBudgets. `Kube` implements it through the Kubernetes API, using the API server proxy or direct connections. |
 | `internal/state` | The migration's state and two `Store` implementations: a ConfigMap (default) and a local file (`--state-file`). |
 | `internal/vm` | Parses VictoriaMetrics' `/metrics` text output, and calls the TSDB status and instant query endpoints. |
@@ -133,12 +135,15 @@ The seams that the unit tests cover are `migration.Copier` and `migration.Pacer`
 (client-go's fake clientset, in the ConfigMap store tests). `cluster.Kube` and the CLI wiring are covered by the
 end-to-end test on kind ([test/e2e](../test/e2e)).
 
-## A sync run
+## Copying
+
+`migrate` copies through `migration.Syncer`: the backfill, every catch-up and the final sync window. `sync` uses the
+same Syncer for a single run.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant CLI as cli (sync)
+    participant CLI as cli (migrate)
     participant S as migration.Syncer
     participant St as state.Store
     participant G as Governor (--adaptive)
@@ -167,8 +172,40 @@ sequenceDiagram
 ```
 
 Every finished chunk is saved before the next one starts, so a crashed or evicted run restarts with the first
-unfinished chunk. The first run starts at `now - retention`. Later runs (catch-up) continue from `SyncedUntil`.
+unfinished chunk. The backfill starts at `now - retention`. Every catch-up continues from `SyncedUntil`.
 Chunk boundaries are aligned to `--step`, so a day step cuts at UTC midnight.
+
+## A migrate run
+
+`migrate` chains the same pieces that the single commands use, and records every step in the state, so a
+restarted pod continues where the last one stopped. It never changes the clusters either: it waits for the changes
+you make and detects them.
+
+```mermaid
+flowchart TD
+    start(["migrate"]) --> done0{"completedAt<br/>in the state?"}
+    done0 -- "yes" --> report(["report: done"])
+    done0 -- "no" --> pf{"backfill started?"}
+    pf -- "no" --> preflight["open both VMClusters and run preflight,<br/>every --poll-interval until no check fails"]
+    pf -- "yes" --> open["open both VMClusters<br/>(preflight would fail on capacity now)"]
+    preflight --> cut0{"cutoverAt<br/>in the state?"}
+    open --> cut0
+    cut0 -- "no" --> sync["sync up to now"]
+    sync --> verify["verify full days without a pass;<br/>copy a failed day again once,<br/>stop if it still fails"]
+    verify --> ready["catch-up shorter than --ready-after:<br/>record readyAt, log 'ready for the cutover'"]
+    ready --> watch{"over one --drain-interval:<br/>blue gets no rows<br/>and green gets live rows?"}
+    watch -- "no" --> sync
+    watch -- "yes, at Tcut" --> final["final sync for Tcut"]
+    cut0 -- "yes" --> final
+    final -- "blue still receives writes" --> sync
+    final -- "checks fail" --> fail(["FAIL: don't delete blue"])
+    final -- "checks pass" --> ok(["record completedAt: done"])
+```
+
+The cutover signal needs both halves: blue at zero alone also happens while VMAgent is down. Green's rate leaves out
+native imports, which are the tool's own copies. The measurement is a hint, not proof, so the final sync's drain
+check follows as before, after `--final-tail`. If it fails because blue still receives rows, nothing was copied or
+recorded, and migrate goes back to catching up.
 
 ## The final sync
 
@@ -177,15 +214,24 @@ up to the moment the check passed, so samples from a writer that stopped late ar
 already ran past the cutover, its window starts at `Tcut - 1h` instead of `SyncedUntil - 1h` (1h is the default of
 `--final-overlap`, which must cover the oldest timestamps that writers bypassing dual write still send), so the time
 around the cutover is always copied and verified. A rerun with the same cutover keeps the first run's window start,
-so a day that failed to verify is copied and verified again. The Helm chart's `mode: final` runs it in a Job that
-doesn't restart on failure: a failed drain check or verify needs a person to look, not a blind rerun.
+so a day that failed to verify is copied and verified again. `migrate` records the first cutover it notices as
+`cutoverSeenAt` before the final sync starts. A failed drain check copies nothing. When blue still received rows,
+that was no cutover: `migrate` clears `cutoverSeenAt` and goes back to catching up. Any other drain failure fails the
+run; the restarted pod (also one evicted during the final sync) catches up, notices the cutover again and starts the
+final sync at `cutoverSeenAt`, because rows blue delivers late carry timestamps from around it. Failed checks after
+the copy fail the run, and the restarted pod runs the final sync again for the recorded cutover. Every catch-up and
+the completion first open both VMClusters again, so one created again during the migration stops it. Green
+counts as ready only while every full day has a whole-day pass. Before the final sync, `migrate` verifies every day
+without one and copies a failing day again (trying again while queries fail, up to 10 times), so the final sync's
+cache reset comes after those copies and its check of earlier failures sees the repaired days. If the final window
+makes the cutover day a full one, that day is verified as a whole afterwards, and the cache is reset again.
 
 ```mermaid
 flowchart TD
-    start(["sync --final --cutover-at Tcut"]) --> wait["wait until Tcut + 15m"]
+    start(["final sync for Tcut"]) --> wait["wait until Tcut + --final-tail (15m)"]
     wait --> drain{"does blue's vminsert accept<br/>no rows for one --drain-interval<br/>and deliver every row it accepted,<br/>within --drain-timeout?"}
-    drain -- "no" --> fail(["FAIL: nothing copied,<br/>a writer still points at blue"])
-    drain -- "unknown: pods restarted<br/>in every interval" --> unknown(["FAIL: nothing copied,<br/>rerun once pods are stable"])
+    drain -- "no: blue still receives rows" --> catchup(["nothing copied: back to catch-up,<br/>a writer still points at blue"])
+    drain -- "no: rows not delivered, or pods<br/>restarted in every interval" --> fail(["FAIL: nothing copied,<br/>the restarted pod tries again"])
     drain -- "yes, at Tdrained" --> copy["copy [min(SyncedUntil, Tcut) - overlap, Tdrained]<br/>(overlap is safe: green deduplicates)"]
     copy --> settle["wait 30s until green<br/>can search the imported rows"]
     settle --> reset["reset the rollup result cache<br/>on every green vmselect pod"]
@@ -207,15 +253,18 @@ created again under the same name (the state records both UIDs).
 |---|---|---|
 | `from`, `to`, `tenant` | every command | Which migration the state belongs to. A state for another one is refused. |
 | `fromUID`, `toUID` | every command that opens the clusters | The VMClusters' UIDs, recorded on first use. A VMCluster that was deleted and created again is refused. |
-| `dualWriteSeenAt` | `preflight` | When green was first seen receiving live writes (T0, or a little after it). |
-| `backfillStart` | `sync` | Where the first sync started. |
-| `syncedUntil` | `sync` | End of the last finished chunk. The next sync continues here. |
-| `chunks` | `sync` | History of finished chunks (window, bytes, seconds), capped at the last 500. Only `status` reads it. |
-| `verifications` | `verify`, `sync --final` | The latest result per UTC day. |
-| `cutoverAt`, `finalStart`, `finalEnd`, `finalSyncAt` | `sync --final` | The cutover time and the window the final sync copied. A rerun clears `finalSyncAt` until its copy finishes. |
+| `dualWriteSeenAt` | `preflight`, `migrate` | When green was first seen receiving live writes (T0, or a little after it). |
+| `backfillStart` | `migrate`, `sync` | Where the first sync started. |
+| `syncedUntil` | `migrate`, `sync` | End of the last finished chunk. The next sync continues here. |
+| `chunks` | `migrate`, `sync` | History of finished chunks (window, bytes, seconds), capped at the last 500. Only `status` reads it. |
+| `verifications` | `verify`, `migrate` | The latest result per UTC day. |
+| `readyAt` | `migrate` | When a catch-up (copy plus verify) first took less than `--ready-after`. |
+| `cutoverSeenAt` | `migrate` | The first cutover noticed, saved before the final sync. A final sync after a restart starts there; cleared when blue receives writes again. |
+| `cutoverAt`, `finalStart`, `finalEnd`, `finalSyncAt` | `migrate` | The cutover time and the window the final sync copied. A rerun clears `finalSyncAt` until its copy finishes. |
+| `completedAt` | `migrate` | When the final sync passed every check. A later `migrate` only reports that it is done. |
 
-Several commands can run at once, for example `verify` from a workstation during a sync Job. So no command writes
-back a state it loaded earlier. Each one calls `Store.Update` with a function that changes only its own fields.
+Several commands can run at once, for example `verify` from a workstation while the migrate Job runs. So no command
+writes back a state it loaded earlier. Each one calls `Store.Update` with a function that changes only its own fields.
 The ConfigMap store applies that function to the latest version, and if the resourceVersion changed in between, it
 reads the state again and retries.
 
@@ -257,7 +306,7 @@ queries do count as instant queries.
 
 ## Metrics
 
-`sync --metrics-addr :8080` serves these metrics, plus Go and process metrics:
+`--metrics-addr :8080` (set by the chart) serves these metrics, plus Go and process metrics:
 
 | Metric | Type | Meaning |
 |---|---|---|
@@ -269,6 +318,7 @@ queries do count as instant queries.
 | `vmrebalance_rate_limit_bytes_per_second` | gauge | Rate limit of the current chunk (0: none). |
 | `vmrebalance_blue_select_concurrency_ratio` | gauge | With `--adaptive`: share of blue's vmselect query slots in use at the last reading. |
 | `vmrebalance_blue_query_duration_seconds{quantile="0.99"}` | gauge | With `--adaptive`: highest query p99 latency on blue at the last reading. |
+| `vmrebalance_phase{phase="..."}` | gauge | 1 for the phase `migrate` is in (`preflight`, `backfill`, `catch-up`, `ready`, `final`, `done`), 0 for the others. |
 
 ## How the tool reaches the clusters
 

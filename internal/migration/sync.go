@@ -54,6 +54,9 @@ type Syncer struct {
 	// FinalOverlap is how far before the last synced point the final sync starts. It must cover the oldest
 	// timestamps that writers bypassing dual write still send. Default: DefaultFinalOverlap.
 	FinalOverlap time.Duration
+	// FinalTail is how long after the cutover the final sync waits before it checks that blue is drained.
+	// Default: DefaultFinalTail.
+	FinalTail time.Duration
 	// Pacer sets each chunk's rate limit. Default: no limit.
 	Pacer Pacer
 	// Metrics records the progress. May be nil.
@@ -112,9 +115,9 @@ const (
 	// DefaultFinalOverlap is how far before the last synced point the final sync starts by default, to pick up
 	// samples that arrived late on blue. Overlaps are safe because green deduplicates samples with equal timestamps.
 	DefaultFinalOverlap = time.Hour
-	// FinalTail is how long after the cutover the final sync waits before it checks that blue is drained, so
-	// writers that switched late have stopped.
-	FinalTail = 15 * time.Minute
+	// DefaultFinalTail is how long after the cutover the final sync waits by default before it checks that blue is
+	// drained, so writers that switched late have stopped.
+	DefaultFinalTail = 15 * time.Minute
 )
 
 // Final runs the last sync after cutover. It waits until cutover + FinalTail, then calls drained, which returns
@@ -130,7 +133,7 @@ func (s *Syncer) Final(ctx context.Context, cutover time.Time, drained func(cont
 		return Window{}, err
 	}
 	if cutover.After(s.Now()) {
-		return Window{}, fmt.Errorf("cutover %s is in the future: run the final sync after switching the aliases",
+		return Window{}, fmt.Errorf("cutover %s is in the future",
 			cutover.UTC().Format(time.RFC3339))
 	}
 	st, err := s.Store.Load(ctx)
@@ -138,7 +141,7 @@ func (s *Syncer) Final(ctx context.Context, cutover time.Time, drained func(cont
 		return Window{}, fmt.Errorf("load state: %w", err)
 	}
 	if st.SyncedUntil.IsZero() {
-		return Window{}, fmt.Errorf("nothing synced yet: run sync (backfill and catch-up) before the final sync")
+		return Window{}, fmt.Errorf("nothing synced yet: the backfill must run before the final sync")
 	}
 	from := st.SyncedUntil
 	if cutover.Before(from) {
@@ -148,7 +151,11 @@ func (s *Syncer) Final(ctx context.Context, cutover time.Time, drained func(cont
 	if overlap <= 0 {
 		overlap = DefaultFinalOverlap
 	}
-	w := Window{Start: from.Add(-overlap), End: cutover.Add(FinalTail)}
+	tail := s.FinalTail
+	if tail <= 0 {
+		tail = DefaultFinalTail
+	}
+	w := Window{Start: from.Add(-overlap), End: cutover.Add(tail)}
 	if st.CutoverAt.Equal(cutover) && !st.FinalStart.IsZero() && st.FinalStart.Before(w.Start) {
 		w.Start = st.FinalStart
 	}
@@ -180,6 +187,16 @@ func (s *Syncer) Final(ctx context.Context, cutover time.Time, drained func(cont
 		return Window{}, fmt.Errorf("save state: %w", err)
 	}
 	return w, nil
+}
+
+// Copy copies the window w again, for example a day that failed verify. It records the chunks like any other copy,
+// but doesn't move the backfill start, and moves SyncedUntil only if w ends after it. Copying a range twice is safe,
+// because green deduplicates samples with equal timestamps.
+func (s *Syncer) Copy(ctx context.Context, w Window) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	return s.copyRange(ctx, w)
 }
 
 func (s *Syncer) copyRange(ctx context.Context, r Window) error {

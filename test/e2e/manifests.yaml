@@ -1,4 +1,5 @@
-# Two small VMClusters and a VMAgent that writes to both (dual write), for the end-to-end test.
+# Two small VMClusters, alias Services that select blue, and a VMAgent that writes to both clusters (dual write:
+# blue through the alias, green directly), for the end-to-end test.
 apiVersion: operator.victoriametrics.com/v1beta1
 kind: VMCluster
 metadata:
@@ -68,7 +69,35 @@ spec:
   selectAllByDefault: true
   scrapeInterval: 10s
   remoteWrite:
-    - url: http://vminsert-blue.monitoring.svc:8480/insert/0/prometheus/api/v1/write
+    - url: http://vminsert-active.monitoring.svc:8480/insert/0/prometheus/api/v1/write
     - url: http://vminsert-green.monitoring.svc:8480/insert/0/prometheus/api/v1/write
   resources:
     requests: {cpu: 50m, memory: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vmselect-active
+  namespace: monitoring
+spec:
+  selector:
+    app.kubernetes.io/name: vmselect
+    app.kubernetes.io/instance: blue
+  ports:
+    - name: http
+      port: 8481
+      targetPort: 8481
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vminsert-active
+  namespace: monitoring
+spec:
+  selector:
+    app.kubernetes.io/name: vminsert
+    app.kubernetes.io/instance: blue
+  ports:
+    - name: http
+      port: 8480
+      targetPort: 8480

@@ -152,7 +152,23 @@ func (c *kubeCluster) get(ctx context.Context, u string) ([]byte, error) {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET %s: %s: %s", u, resp.Status, strings.TrimSpace(string(body[:min(len(body), 512)])))
+		return nil, &HTTPError{URL: u, StatusCode: resp.StatusCode, Status: resp.Status,
+			Body: strings.TrimSpace(string(body[:min(len(body), 512)]))}
 	}
 	return body, nil
+}
+
+// HTTPError is a response other than 200 OK from a VictoriaMetrics component, reached directly.
+type HTTPError struct {
+	URL        string
+	StatusCode int
+	Status     string
+	Body       string // the start of the response body
+}
+
+func (e *HTTPError) Error() string { return fmt.Sprintf("GET %s: %s: %s", e.URL, e.Status, e.Body) }
+
+// Refused reports whether the component refused the request (401 or 403), which retrying won't fix.
+func (e *HTTPError) Refused() bool {
+	return e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusForbidden
 }

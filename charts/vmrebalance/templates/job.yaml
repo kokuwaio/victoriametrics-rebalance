@@ -4,14 +4,9 @@ metadata:
   name: {{ include "vmrebalance.jobName" . }}
   labels:
     {{- include "vmrebalance.labels" . | nindent 4 }}
-    app.kubernetes.io/component: {{ .Values.mode }}
+    app.kubernetes.io/component: migrate
 spec:
-  {{- if eq .Values.mode "final" }}
-  # A failed drain check or verify needs a person to look, not a rerun.
-  backoffLimit: 0
-  {{- else }}
   backoffLimit: {{ .Values.job.backoffLimit }}
-  {{- end }}
   {{- with .Values.job.activeDeadlineSeconds }}
   activeDeadlineSeconds: {{ . }}
   {{- end }}
@@ -26,18 +21,14 @@ spec:
       {{- end }}
       labels:
         {{- include "vmrebalance.labels" . | nindent 8 }}
-        app.kubernetes.io/component: {{ .Values.mode }}
+        app.kubernetes.io/component: migrate
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
       serviceAccountName: {{ include "vmrebalance.serviceAccountName" . }}
-      {{- if eq .Values.mode "final" }}
-      restartPolicy: Never
-      {{- else }}
-      # A restarted pod continues with the first unfinished chunk.
+      # A restarted pod continues from the state.
       restartPolicy: OnFailure
-      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

@@ -37,6 +37,8 @@ type Result struct {
 	Name    string
 	Level   Level
 	Message string
+	// Err is the error that failed the check, if one did, so a caller can tell e.g. missing permissions apart.
+	Err error
 }
 
 // Report is the outcome of a set of checks.
@@ -56,6 +58,11 @@ func AnyFailed(results []Result) bool {
 
 func (r *Report) add(name string, l Level, format string, args ...any) {
 	r.Results = append(r.Results, Result{Name: name, Level: l, Message: fmt.Sprintf(format, args...)})
+}
+
+// fail adds a failed check for err.
+func (r *Report) fail(name string, err error) {
+	r.Results = append(r.Results, Result{Name: name, Level: Fail, Message: err.Error(), Err: err})
 }
 
 // rowsInserted counts the rows a vminsert pod accepted.

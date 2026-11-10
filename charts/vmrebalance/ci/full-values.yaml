@@ -1,0 +1,14 @@
+from: blue
+to: green
+aliases:
+  select: vmselect-active
+  insert: vminsert-active
+migrate:
+  since: "2026-01-02T10:00:00Z"
+copy:
+  maxQueryLatency: 5s
+metrics:
+  podScrape:
+    enabled: true
+imagePullSecrets:
+  - name: ghcr

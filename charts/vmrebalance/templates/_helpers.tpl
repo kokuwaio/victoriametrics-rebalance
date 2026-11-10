@@ -72,18 +72,15 @@ The image, with the tag defaulting to v<appVersion>.
 The Job's name: one Job per release revision, so every upgrade starts a new run.
 */}}
 {{- define "vmrebalance.jobName" -}}
-{{- printf "%s-%s-%d" (include "vmrebalance.fullname" . | trunc 50 | trimSuffix "-") .Values.mode .Release.Revision }}
+{{- printf "%s-%d" (include "vmrebalance.fullname" . | trunc 52 | trimSuffix "-") .Release.Revision }}
 {{- end }}
 
 {{/*
-The vmrebalance arguments for the configured mode, as a YAML list. toYaml quotes every value that needs it.
+The vmrebalance arguments, as a YAML list. toYaml quotes every value that needs it.
 */}}
 {{- define "vmrebalance.args" -}}
 {{- $v := .Values -}}
-{{- if not (has $v.mode (list "sync" "final")) }}
-{{- fail (printf "mode must be \"sync\" or \"final\", not %q" $v.mode) }}
-{{- end }}
-{{- $args := list "sync"
+{{- $args := list "migrate"
   (printf "--namespace=%s" .Release.Namespace)
   (printf "--from=%s" (required "from (the old VMCluster) is required" $v.from))
   (printf "--to=%s" (required "to (the new VMCluster) is required" $v.to))
@@ -91,40 +88,42 @@ The vmrebalance arguments for the configured mode, as a YAML list. toYaml quotes
   (printf "--concurrency=%d" (int $v.copy.concurrency))
   (printf "--step=%s" $v.copy.step)
   (printf "--retries=%d" (int $v.copy.retries))
-  (printf "--backoff=%s" $v.copy.backoff) }}
+  (printf "--backoff=%s" $v.copy.backoff)
+  (printf "--final-overlap=%s" $v.final.overlap)
+  (printf "--final-tail=%s" $v.final.tail)
+  (printf "--drain-interval=%s" $v.final.drainInterval)
+  (printf "--drain-timeout=%s" $v.final.drainTimeout)
+  (printf "--top-n=%d" (int $v.verify.topN))
+  (printf "--random-n=%d" (int $v.verify.randomN))
+  (printf "--pool=%d" (int $v.verify.pool))
+  (printf "--tolerance=%v" $v.verify.tolerance)
+  (printf "--headroom=%v" $v.migrate.headroom)
+  (printf "--poll-interval=%s" $v.migrate.pollInterval)
+  (printf "--ready-after=%s" $v.migrate.readyAfter) }}
 {{- with $v.copy.rateLimit }}
 {{- $args = append $args (printf "--rate-limit=%s" .) }}
 {{- end }}
-{{- if eq $v.mode "sync" }}
-{{- if $v.sync.adaptive }}
+{{- if $v.copy.adaptive }}
 {{- if not $v.copy.rateLimit }}
-{{- fail "sync.adaptive needs copy.rateLimit as the highest rate" }}
+{{- fail "copy.adaptive needs copy.rateLimit as the highest rate" }}
 {{- end }}
 {{- $args = append $args "--adaptive" }}
-{{- $args = append $args (printf "--max-select-utilization=%v" $v.sync.maxSelectUtilization) }}
-{{- with $v.sync.minRateLimit }}
+{{- $args = append $args (printf "--max-select-utilization=%v" $v.copy.maxSelectUtilization) }}
+{{- with $v.copy.minRateLimit }}
 {{- $args = append $args (printf "--min-rate-limit=%s" .) }}
 {{- end }}
-{{- with $v.sync.maxQueryLatency }}
+{{- with $v.copy.maxQueryLatency }}
 {{- $args = append $args (printf "--max-query-latency=%s" .) }}
 {{- end }}
 {{- end }}
-{{- with $v.sync.since }}
+{{- with $v.migrate.since }}
 {{- $args = append $args (printf "--since=%s" .) }}
 {{- end }}
-{{- with $v.sync.until }}
-{{- $args = append $args (printf "--until=%s" .) }}
+{{- with $v.aliases.select }}
+{{- $args = append $args (printf "--select-alias=%s" .) }}
 {{- end }}
-{{- else }}
-{{- $args = append $args "--final" }}
-{{- $args = append $args (printf "--cutover-at=%s" (required "final.cutoverAt (when the aliases were switched, RFC 3339) is required with mode final" $v.final.cutoverAt)) }}
-{{- $args = append $args (printf "--final-overlap=%s" $v.final.overlap) }}
-{{- $args = append $args (printf "--drain-interval=%s" $v.final.drainInterval) }}
-{{- $args = append $args (printf "--drain-timeout=%s" $v.final.drainTimeout) }}
-{{- $args = append $args (printf "--top-n=%d" (int $v.verify.topN)) }}
-{{- $args = append $args (printf "--random-n=%d" (int $v.verify.randomN)) }}
-{{- $args = append $args (printf "--pool=%d" (int $v.verify.pool)) }}
-{{- $args = append $args (printf "--tolerance=%v" $v.verify.tolerance) }}
+{{- with $v.aliases.insert }}
+{{- $args = append $args (printf "--insert-alias=%s" .) }}
 {{- end }}
 {{- if $v.metrics.enabled }}
 {{- $args = append $args (printf "--metrics-addr=:%d" (int $v.metrics.port)) }}

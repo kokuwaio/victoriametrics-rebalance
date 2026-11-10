@@ -44,8 +44,10 @@ Throughput:       1.1 MiB/s
 Catch-up ETA:     ~29.4s at the recorded pace
 Verified days:    1 pass, 1 fail
   2025-12-03: [series: blue 10, green 9]
+Ready:            -
 Cutover:          -
 Final sync:       -
+Completed:        -
 `
 	if out.String() != want {
 		t.Errorf("status:\n%s\nwant:\n%s", out.String(), want)
@@ -141,9 +143,11 @@ func TestCommandsRejectBadFlagsBeforeConnecting(t *testing.T) {
 		"dotted cluster name":      {[]string{"status", "--kubeconfig", kc, "--from", "blue.x", "--to", "green"}, "dots"},
 		"unknown access mode":      {append([]string{"status", "--access", "tunnel"}, common...), "--access must be"},
 		"zero step":                {append([]string{"sync", "--step", "0"}, common...), "--step must be positive"},
-		"final without cutover":    {append([]string{"sync", "--final"}, common...), "--final needs --cutover-at"},
-		"short drain interval":     {append([]string{"sync", "--final", "--cutover-at", "2026-01-01T00:00:00Z", "--drain-interval", "30s"}, common...), "at least 1m"},
-		"zero final overlap":       {append([]string{"sync", "--final", "--cutover-at", "2026-01-01T00:00:00Z", "--final-overlap", "0"}, common...), "--final-overlap"},
+		"no final sync in sync":    {append([]string{"sync", "--final"}, common...), "unknown flag: --final"},
+		"migrate short drain":      {append([]string{"migrate", "--drain-interval", "30s"}, common...), "at least 1m"},
+		"migrate zero poll":        {append([]string{"migrate", "--poll-interval", "0"}, common...), "--poll-interval"},
+		"migrate bad since":        {append([]string{"migrate", "--since", "yesterday"}, common...), "--since"},
+		"zero final overlap":       {append([]string{"migrate", "--final-overlap", "0"}, common...), "--final-overlap"},
 		"rate limit through vmctl": {append([]string{"sync", "--vmctl-arg=--vm-rate-limit=100"}, common...), "--rate-limit"},
 		"negative top-n":           {append([]string{"verify", "--top-n", "-1"}, common...), "must not be negative"},
 		"missing --to":             {[]string{"status", "--kubeconfig", kc, "--from", "blue"}, "to"},
@@ -227,9 +231,8 @@ func finalSetup(t *testing.T, blue *fakeCluster) (*env, *strings.Builder, *syncO
 	}
 	noSleep := func(context.Context, time.Duration) error { return nil }
 	o := &syncOptions{
-		cutoverAt: "2026-01-05T10:30:00Z",
-		drain:     check.DrainOptions{Interval: time.Minute, Timeout: 3 * time.Minute, Sleep: noSleep},
-		verify:    verifyOpts,
+		drain:  check.DrainOptions{Interval: time.Minute, Timeout: 3 * time.Minute, Sleep: noSleep},
+		verify: verifyOpts,
 	}
 	c := &recordingCopier{}
 	syncer := &migration.Syncer{
@@ -240,47 +243,56 @@ func finalSetup(t *testing.T, blue *fakeCluster) (*env, *strings.Builder, *syncO
 	return e, out, o, syncer, c, green
 }
 
-func TestRunFinalCopiesResetsTheCacheAndVerifies(t *testing.T) {
-	e, out, o, syncer, c, green := finalSetup(t, newFake("blue"))
+// cutover is the cutover of the final sync tests, half an hour before their clock's now.
+var cutover = ts("2026-01-05T10:30:00Z")
 
-	if err := runFinal(t.Context(), e, o, syncer); err != nil {
-		t.Fatalf("runFinal: %v\n%s", err, out)
+func TestFinalSyncCopiesResetsTheCacheAndVerifies(t *testing.T) {
+	e, _, o, syncer, c, green := finalSetup(t, newFake("blue"))
+
+	results, err := finalSync(t.Context(), e, o, syncer, cutover)
+
+	if err != nil || check.AnyFailed(results) {
+		t.Fatalf("finalSync = %v, %+v", err, results)
 	}
-
 	if len(c.windows) == 0 || !c.windows[0].Start.Equal(ts("2026-01-05T09:00:00Z")) {
 		t.Errorf("copied %v, want a window from one hour before the last synced point", c.windows)
 	}
 	if !strings.Contains(strings.Join(green.podGets, " "), "vmselect-green-0/internal/resetRollupResultCache") {
 		t.Errorf("green calls = %v, want the rollup cache reset", green.podGets)
 	}
-	for _, line := range []string{"PASS  blue drained", "PASS  rollup cache", "PASS  verify 2026-01-05", "PASS  earlier verify", "Done."} {
-		if !strings.Contains(out.String(), line) {
-			t.Errorf("output lacks %q:\n%s", line, out)
-		}
+	var names []string
+	for _, r := range results {
+		names = append(names, r.Name)
+	}
+	if got := strings.Join(names, ","); got != "blue drained,rollup cache,verify 2026-01-05,earlier verify" {
+		t.Errorf("checks = %s", got)
 	}
 }
 
-func TestRunFinalCopiesNothingWhileBlueReceivesWrites(t *testing.T) {
+func TestFinalSyncCopiesNothingWhileBlueReceivesWrites(t *testing.T) {
 	blue := newFake("blue")
 	blue.inserts = []string{insertMetrics(1000), insertMetrics(1600), insertMetrics(2200), insertMetrics(2800),
 		insertMetrics(3400), insertMetrics(4000)}
-	e, out, o, syncer, c, _ := finalSetup(t, blue)
+	e, _, o, syncer, c, _ := finalSetup(t, blue)
 
-	err := runFinal(t.Context(), e, o, syncer)
+	results, err := finalSync(t.Context(), e, o, syncer, cutover)
 
-	if !errors.Is(err, errChecksFailed) || len(c.windows) != 0 {
-		t.Errorf("err = %v, copied %v; want a failed check and no copy", err, c.windows)
-	}
-	if !strings.Contains(out.String(), "FAIL  blue drained") || !strings.Contains(out.String(), "Nothing copied") {
-		t.Errorf("output:\n%s", out)
+	if !errors.Is(err, errNotDrained) || len(c.windows) != 0 || len(results) != 1 || results[0].Level != check.Fail {
+		t.Errorf("finalSync = %v, %+v, copied %v; want a failed drain check and no copy", err, results, c.windows)
 	}
 }
 
-func TestRunFinalRejectsNowAsTheCutover(t *testing.T) {
-	e, _, o, syncer, _, _ := finalSetup(t, newFake("blue"))
-	o.cutoverAt = "now"
+func TestFinalSyncFailsWhenBlueCanNotDeliverItsRows(t *testing.T) {
+	blue := newFake("blue")
+	// No new rows, but blue's vminsert can't reach a vmstorage node: that's no writer pointing at blue, so catching up
+	// again wouldn't help.
+	blue.inserts = []string{strings.Replace(insertMetrics(1000), "vm_rpc_vmstorage_is_reachable 1", "vm_rpc_vmstorage_is_reachable 0", 1)}
+	e, _, o, syncer, c, _ := finalSetup(t, blue)
 
-	if err := runFinal(t.Context(), e, o, syncer); err == nil || !strings.Contains(err.Error(), "not \"now\"") {
-		t.Errorf("err = %v", err)
+	results, err := finalSync(t.Context(), e, o, syncer, cutover)
+
+	if err != nil || len(c.windows) != 0 || len(results) != 1 || results[0].Level != check.Fail ||
+		!strings.Contains(results[0].Message, "vmstorage") {
+		t.Errorf("finalSync = %v, %+v, copied %v; want only the failed drain check and no copy", err, results, c.windows)
 	}
 }

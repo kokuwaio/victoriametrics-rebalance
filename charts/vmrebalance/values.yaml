@@ -1,22 +1,39 @@
 # Default values for vmrebalance. Keys are sorted alphabetically.
 #
-# Every install or upgrade of the release starts one Job, named <release>-<mode>-<revision>:
-# - mode "sync" copies blue's data into green: the first run is the backfill, every later upgrade a catch-up. A
-#   restarted pod continues with the first unfinished chunk, because the state lives in a ConfigMap.
-# - mode "final" runs the final sync after the cutover (set final.cutoverAt). It doesn't restart on failure.
-# An upgrade removes the Job of the previous revision, also while it still runs: wait until it has finished. Use
-# `helm upgrade --reset-then-reuse-values`, so a newer chart version keeps its new defaults. The revision in the Job
-# name needs Helm's own release history (helm, Flux); tools that only run `helm template` (Argo CD) always render
-# revision 1. See docs/usage.md in the repository.
+# The chart runs `vmrebalance migrate` as one Job, named <release>-<revision>: preflight, backfill, verify, catch-up,
+# and the final sync once the writers (and the aliases, if set) point at green. Install it once with from and to;
+# switch the aliases when it logs that green is ready. A restarted pod continues where the last one stopped, because
+# the state lives in a ConfigMap.
+#
+# An upgrade (e.g. to change the rate limit) removes the running Job and starts a new one, which continues from the
+# state. Use `helm upgrade --reset-then-reuse-values`, so a newer chart version keeps its new defaults. The revision
+# in the Job name needs Helm's own release history (helm, Flux); tools that only run `helm template` (Argo CD)
+# always render revision 1. See docs/usage.md in the repository.
 
 affinity: {}
 
-# Used in both modes.
+# The Services that readers and writers use instead of the operator's own ones. When set, preflight fails until they
+# select only blue's pods, migrate waits until they select green's before it takes the cutover as done, and the final
+# sync fails while one still selects blue.
+aliases:
+  # -- Service in front of vminsert, e.g. vminsert-active. Empty: not checked.
+  insert: ""
+  # -- Service in front of vmselect, e.g. vmselect-active. Empty: not checked.
+  select: ""
+
 copy:
+  # -- Lower the rate limit while blue's vmselect is busy (needs rateLimit).
+  adaptive: true
   # -- Wait before the first retry; it doubles with every further retry.
   backoff: 1m
   # -- vmctl workers.
   concurrency: 2
+  # -- With adaptive: p99 query latency above which blue counts as busy, e.g. 5s. Empty ignores latency.
+  maxQueryLatency: ""
+  # -- With adaptive: share of blue's vmselect query slots in use above which blue counts as busy.
+  maxSelectUtilization: 0.8
+  # -- With adaptive: the lowest rate. Empty means a tenth of rateLimit.
+  minRateLimit: ""
   # -- Total transfer rate limit across all vmctl workers, e.g. 50MiB/s. Empty means no limit.
   rateLimit: 50MiB/s
   # -- Retries per failed chunk.
@@ -27,16 +44,17 @@ copy:
 # -- Further arguments for vmrebalance, e.g. ["--verbose"].
 extraArgs: []
 
-# Used with mode "final".
+# The final sync after the cutover.
 final:
-  # -- When the aliases were switched to green (RFC 3339). Required with mode "final".
-  cutoverAt: ""
-  # -- Blue must receive no rows for this long (at least 1m, longer than the slowest writer's push interval).
+  # -- Blue must receive no rows for this long (at least 1m, longer than the slowest writer's push interval). The
+  # writes are also measured over this window to notice the cutover.
   drainInterval: 5m
-  # -- How long blue may still receive writes after cutover + 15m.
+  # -- How long blue may still receive writes after cutover + tail.
   drainTimeout: 20m
   # -- How far before the last synced point the final window starts.
   overlap: 1h
+  # -- How long after the cutover the final sync waits before it checks that blue is drained.
+  tail: 15m
 
 # -- Name of the old VMCluster (blue), in the release namespace. Required.
 from: ""
@@ -53,15 +71,15 @@ image:
 imagePullSecrets: []
 
 job:
-  # -- Stop the Job after this many seconds. Mind the 15m wait, the drain timeout and the copy in mode "final".
+  # -- Stop the Job after this many seconds. The whole migration runs in it, so leave it empty unless you want a limit.
   activeDeadlineSeconds: null
-  # -- Retries of the sync pod (mode "final" never retries).
+  # -- Restarts of the pod after a failure; each one continues from the state.
   backoffLimit: 10
   # -- Delete the finished Job after this many seconds. Empty keeps it until the next upgrade.
   ttlSecondsAfterFinished: null
 
 metrics:
-  # -- Serve the tool's Prometheus metrics (progress, rate limit, blue's load).
+  # -- Serve the tool's Prometheus metrics (progress, phase, rate limit, blue's load).
   enabled: true
   podScrape:
     # -- Create a VMPodScrape for the VictoriaMetrics operator.
@@ -73,8 +91,15 @@ metrics:
   # -- Port of the metrics endpoint (container port "http-metrics").
   port: 8080
 
-# -- "sync" (backfill and catch-up) or "final" (the final sync after the cutover).
-mode: sync
+migrate:
+  # -- Free space green needs on top of blue's used bytes (0.2 = 20%), checked by preflight.
+  headroom: 0.2
+  # -- How often to try again while a VMCluster is missing or a preflight check fails.
+  pollInterval: 1m
+  # -- A catch-up that takes less than this makes green ready for the cutover.
+  readyAfter: 10m
+  # -- Start the backfill here instead of now - retention (RFC 3339).
+  since: ""
 
 nameOverride: ""
 
@@ -116,22 +141,6 @@ serviceAccount:
   # -- Name of the ServiceAccount. Defaults to the full name of the release.
   name: ""
 
-# Used with mode "sync".
-sync:
-  # -- Lower the rate limit while blue's vmselect is busy (needs copy.rateLimit).
-  adaptive: true
-  # -- With adaptive: p99 query latency above which blue counts as busy, e.g. 5s. Empty ignores latency.
-  maxQueryLatency: ""
-  # -- With adaptive: share of blue's vmselect query slots in use above which blue counts as busy.
-  maxSelectUtilization: 0.8
-  # -- With adaptive: the lowest rate. Empty means a tenth of copy.rateLimit.
-  minRateLimit: ""
-  # -- On the first run, start here instead of now - retention (RFC 3339), e.g. for a rollback.
-  since: ""
-  # -- Copy up to this time (RFC 3339). Empty means now. It sticks with --reset-then-reuse-values: reset it for
-  # later catch-up runs.
-  until: ""
-
 # -- Tenant to copy and check, e.g. "0" or "1:2".
 tenant: "0"
 
@@ -140,7 +149,7 @@ to: ""
 
 tolerations: []
 
-# Verify settings for the final sync.
+# Verify settings, for the days the backfill and catch-ups copied and for the final sync.
 verify:
   # -- Pick the random names from this many names below the top N.
   pool: 1000

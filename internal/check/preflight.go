@@ -38,6 +38,8 @@ type PreflightOptions struct {
 	// RateWindow is the time between the two scrapes that measure ingestion rates.
 	RateWindow time.Duration
 	Sleep      Sleeper
+	// Aliases, when configured, must select blue's pods.
+	Aliases Aliases
 }
 
 // Preflight checks that green is ready to receive blue's data.
@@ -67,6 +69,10 @@ func Preflight(ctx context.Context, blue, green cluster.Client, o PreflightOptio
 	capacity(ctx, &r, blue, green, o.Headroom)
 	dualWrite(ctx, &r, blue, green, o)
 	podLabels(ctx, &r, blue, green)
+	if o.Aliases.Configured() {
+		// Until the cutover, readers and writers must reach blue alone: green is still being filled.
+		r.Results = append(r.Results, CheckAliases(ctx, o.Aliases, blue, green, blue, Fail)...)
+	}
 	return r
 }
 
@@ -91,12 +97,12 @@ func versions(ctx context.Context, r *Report, blue, green cluster.Client) {
 	for _, c := range cluster.Components {
 		bt, err := imageTags(ctx, blue, c)
 		if err != nil {
-			r.add(Version, Fail, "%v", err)
+			r.fail(Version, err)
 			return
 		}
 		gt, err := imageTags(ctx, green, c)
 		if err != nil {
-			r.add(Version, Fail, "%v", err)
+			r.fail(Version, err)
 			return
 		}
 		if len(bt) != 1 || !slices.Equal(bt, gt) {
@@ -199,12 +205,12 @@ func relabeling(r *Report, g cluster.Info) {
 func capacity(ctx context.Context, r *Report, blue, green cluster.Client, headroom float64) {
 	used, err := scrape(ctx, blue, cluster.Storage, "vm_data_size_bytes", nil)
 	if err != nil {
-		r.add(Capacity, Fail, "%v", err)
+		r.fail(Capacity, err)
 		return
 	}
 	free, err := scrape(ctx, green, cluster.Storage, "vm_free_disk_space_bytes", nil)
 	if err != nil {
-		r.add(Capacity, Fail, "%v", err)
+		r.fail(Capacity, err)
 		return
 	}
 	u, f := total(used), total(free)
@@ -245,12 +251,12 @@ func dualWrite(ctx context.Context, r *Report, blue, green cluster.Client, o Pre
 		m, err := insertRate(ctx, blue, o.RateWindow, o.Sleep, nil)
 		done <- rate{m.rate, err}
 	}()
-	gm, gerr := insertRate(ctx, green, o.RateWindow, o.Sleep, func(l map[string]string) bool { return l["type"] != "native" })
+	gm, gerr := insertRate(ctx, green, o.RateWindow, o.Sleep, liveWrites)
 	gr := gm.rate
 	b := <-done
 	br := b.v
 	if err := firstErr(b.err, gerr); err != nil {
-		r.add(DualWrite, Fail, "%v", err)
+		r.fail(DualWrite, err)
 		return
 	}
 	if gr == 0 {
@@ -285,12 +291,12 @@ func firstErr(errs ...error) error {
 func podLabels(ctx context.Context, r *Report, blue, green cluster.Client) {
 	bluePods, err := allPods(ctx, blue)
 	if err != nil {
-		r.add(PodLabels, Fail, "%v", err)
+		r.fail(PodLabels, err)
 		return
 	}
 	greenPods, err := allPods(ctx, green)
 	if err != nil {
-		r.add(PodLabels, Fail, "%v", err)
+		r.fail(PodLabels, err)
 		return
 	}
 	var problems []string
@@ -304,7 +310,7 @@ func podLabels(ctx context.Context, r *Report, blue, green cluster.Client) {
 	for _, c := range []cluster.Client{blue, green} {
 		pdbs, err := c.PDBs(ctx)
 		if err != nil {
-			r.add(PodLabels, Fail, "list PodDisruptionBudgets: %v", err)
+			r.fail(PodLabels, fmt.Errorf("list PodDisruptionBudgets: %w", err))
 			return
 		}
 		for _, p := range pdbs {
