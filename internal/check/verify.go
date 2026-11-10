@@ -37,15 +37,22 @@ func VerifyDay(ctx context.Context, blue, green cluster.Client, start, end time.
 		r.Pass = false
 		r.Problems = append(r.Problems, fmt.Sprintf(format, args...))
 	}
+	// queryFailed records a request that failed: the day is unverified, not known to miss data.
+	queryFailed := func(side string, err error) {
+		if r.Err == nil {
+			r.Err = err
+		}
+		problem("%s: %v", side, err)
+	}
 
 	bs, err := vm.TSDB(ctx, blue.SelectGet, day, o.TopN+o.Pool)
 	if err != nil {
-		problem("blue: %v", err)
+		queryFailed("blue", err)
 		return r
 	}
 	gs, err := vm.TSDB(ctx, green.SelectGet, day, 1)
 	if err != nil {
-		problem("green: %v", err)
+		queryFailed("green", err)
 		return r
 	}
 	r.BlueSeries, r.GreenSeries = bs.TotalSeries, gs.TotalSeries
@@ -64,12 +71,12 @@ func VerifyDay(ctx context.Context, blue, green cluster.Client, start, end time.
 		q := fmt.Sprintf("sum(count_over_time(%s[%dms]))", vm.MetricSelector(name), window)
 		bc, err := vm.QuerySum(ctx, blue.SelectGet, q, at)
 		if err != nil {
-			problem("blue: %v", err)
+			queryFailed("blue", err)
 			continue
 		}
 		gc, err := vm.QuerySum(ctx, green.SelectGet, q, at)
 		if err != nil {
-			problem("green: %v", err)
+			queryFailed("green", err)
 			continue
 		}
 		if fallsShort(bc, gc, o.Tolerance) {

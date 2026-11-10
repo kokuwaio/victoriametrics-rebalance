@@ -142,13 +142,16 @@ func verifyDays(ctx context.Context, e *env, v verifyFlags, from, to time.Time) 
 		}
 		res := check.Result{Name: "verify " + state.DayKey(d), Level: check.Pass, Message: msg}
 		if !r.Pass {
-			res.Level, res.Message = check.Fail, strings.Join(r.Problems, "; ")
+			res.Level, res.Message, res.Err = check.Fail, strings.Join(r.Problems, "; "), r.Err
 		}
 		results = append(results, res)
 	}
 	if _, err := e.store.Update(ctx, func(st *state.State) {
 		for i := range days {
-			st.SetVerification(days[i], dayResults[i])
+			// A day whose queries failed is unverified, not known to miss data: keep what the state had.
+			if dayResults[i].Err == nil {
+				st.SetVerification(days[i], dayResults[i])
+			}
 		}
 	}); err != nil {
 		return nil, err

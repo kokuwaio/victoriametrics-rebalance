@@ -22,7 +22,8 @@ type fakeCluster struct {
 	samples float64
 	inserts []string
 	podGets []string
-	podsErr error // returned by Pods when set
+	podsErr   error // returned by Pods when set
+	selectErr error // returned by SelectGet when set
 }
 
 func newFake(name string) *fakeCluster {
@@ -66,6 +67,9 @@ func (f *fakeCluster) PodGet(_ context.Context, pod *corev1.Pod, _ cluster.Compo
 }
 
 func (f *fakeCluster) SelectGet(_ context.Context, path string, _ url.Values) ([]byte, error) {
+	if f.selectErr != nil {
+		return nil, f.selectErr
+	}
 	var data any
 	switch path {
 	case "api/v1/status/tsdb":

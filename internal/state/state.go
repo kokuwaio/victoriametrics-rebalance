@@ -75,6 +75,9 @@ type DayResult struct {
 	// From and Until are the time range [From, Until) that was checked.
 	From  time.Time `json:"from,omitzero"`
 	Until time.Time `json:"until,omitzero"`
+	// Err is the first request that failed, if one did: then the day is unverified rather than known to miss data.
+	// It isn't saved.
+	Err error `json:"-"`
 }
 
 // covers reports whether r checked at least the time range old checked.

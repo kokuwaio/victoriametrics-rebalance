@@ -101,6 +101,7 @@ func newMigrateTest(t *testing.T) *migrateTest {
 	tc.m = &migrator{
 		e: tc.e, o: o, phase: migration.NewPhase(tc.metrics),
 		open: func(context.Context) error { return nil },
+		uid:  func(_ context.Context, name string) (string, error) { return "uid-" + name, nil },
 		preflight: func(context.Context) check.Report {
 			tc.preflights++
 			if tc.preflights == 1 {
@@ -325,15 +326,20 @@ func TestMigrateCountsTheVerifyOfACatchUpTowardsReady(t *testing.T) {
 	// 2026-01-04 fails verify until it is copied again: the first catch-up copies for a minute, then copies that day
 	// again for another minute. Blue receives writes until the second measurement.
 	tc.green.samples = 50
-	tc.copier.onCopy = func(migration.Window) { tc.green.samples = 100 }
+	tc.copier.onCopy = func(w migration.Window) {
+		if w.Start.Equal(ts("2026-01-04T00:00:00Z")) {
+			tc.green.samples = 100
+		}
+	}
 	tc.blue.inserts = []string{insertMetrics(1000), insertMetrics(1600), insertMetrics(1600)}
 
 	if err := tc.m.run(t.Context()); err != nil {
 		t.Fatalf("run: %v\n%s", err, tc.out)
 	}
 
-	// Ready only after the second catch-up: the first one took 2 minutes in all, longer than --ready-after.
-	if st, _ := tc.e.store.Load(t.Context()); !st.ReadyAt.After(ts("2026-01-05T10:03:00Z")) {
+	// Ready only after the second catch-up: the first one took 3 minutes in all (copy, settle, copy again, settle),
+	// longer than --ready-after.
+	if st, _ := tc.e.store.Load(t.Context()); !st.ReadyAt.After(ts("2026-01-05T10:04:00Z")) {
 		t.Errorf("ready at %s, want it after the second catch-up", st.ReadyAt)
 	}
 }
@@ -354,6 +360,42 @@ func TestMigrateStopsWhenGreenIsCreatedAgainDuringTheMigration(t *testing.T) {
 	var replaced *state.ClusterReplacedError
 	if st, _ := tc.e.store.Load(t.Context()); !errors.As(err, &replaced) || !st.CompletedAt.IsZero() {
 		t.Errorf("run = %v, completed at %s; want it stopped before completing", err, st.CompletedAt)
+	}
+}
+
+func TestMigrateReportsTheMigrationDoneOnlyForTheSameClusters(t *testing.T) {
+	notFound := apierrors.NewNotFound(schema.GroupResource{Resource: "vmclusters"}, "blue")
+	for name, tt := range map[string]struct {
+		uids map[string]string // UID per existing VMCluster
+		fail bool
+	}{
+		"both still there":                        {uids: map[string]string{"blue": "uid-blue", "green": "uid-green"}},
+		"blue deleted after the migration":        {uids: map[string]string{"green": "uid-green"}},
+		"green created again since, blue is gone": {uids: map[string]string{"green": "uid-green-new"}, fail: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tc := newMigrateTest(t)
+			if _, err := tc.e.store.Update(t.Context(), func(s *state.State) {
+				s.From, s.To, s.FromUID, s.ToUID = "blue", "green", "uid-blue", "uid-green"
+				s.CompletedAt = ts("2026-01-05T09:00:00Z")
+			}); err != nil {
+				t.Fatal(err)
+			}
+			tc.m.open = func(context.Context) error { return errors.New("don't open both: blue may be gone") }
+			tc.m.uid = func(_ context.Context, name string) (string, error) {
+				if uid, ok := tt.uids[name]; ok {
+					return uid, nil
+				}
+				return "", notFound
+			}
+
+			err := tc.m.run(t.Context())
+
+			var replaced *state.ClusterReplacedError
+			if tt.fail != errors.As(err, &replaced) || !tt.fail && err != nil {
+				t.Errorf("run = %v, want a replaced VMCluster: %v", err, tt.fail)
+			}
+		})
 	}
 }
 
@@ -468,6 +510,40 @@ func TestMigrateCopiesAFailedDayAgain(t *testing.T) {
 			}
 			if !heals && (!errors.Is(err, errChecksFailed) || !strings.Contains(tc.out.String(), "FAIL  verify 2026-01-04")) {
 				t.Errorf("err = %v, output:\n%s", err, tc.out)
+			}
+		})
+	}
+}
+
+func TestMigrateDoesNotCopyADayAgainWhenItsVerifyCouldNotQuery(t *testing.T) {
+	for name, tt := range map[string]struct {
+		err  error
+		stop bool
+	}{
+		"a timeout: verify it again after the next catch-up": {err: errors.New("context deadline exceeded")},
+		"refused by green's vmselect":                        {err: &cluster.HTTPError{URL: "http://vmselect-green:8481", StatusCode: 403, Status: "403 Forbidden"}, stop: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tc := newMigrateTest(t)
+			if _, err := tc.e.store.Update(t.Context(), func(s *state.State) {
+				s.BackfillStart, s.SyncedUntil = ts("2026-01-03T00:00:00Z"), ts("2026-01-05T10:00:00Z")
+			}); err != nil {
+				t.Fatal(err)
+			}
+			tc.green.selectErr = tt.err
+
+			err := tc.m.verifyCopiedDays(t.Context(), &migration.Syncer{
+				Copier: tc.copier, Store: tc.e.store, Step: time.Hour, Now: tc.clock.Now, Sleep: tc.clock.Sleep,
+			})
+
+			if len(tc.copier.windows) != 0 {
+				t.Errorf("copied %v again, want nothing: the data may be fine", tc.copier.windows)
+			}
+			if tt.stop != (err != nil) {
+				t.Errorf("err = %v, want stop = %v", err, tt.stop)
+			}
+			if st, _ := tc.e.store.Load(t.Context()); len(unverifiedDays(st)) != 2 {
+				t.Errorf("unverified days = %v, want both days still unverified", unverifiedDays(st))
 			}
 		})
 	}

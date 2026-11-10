@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/check"
+	"github.com/kokuwaio/victoriametrics-rebalance/internal/cluster"
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/migration"
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/state"
 )
@@ -96,6 +98,13 @@ func runMigrate(cmd *cobra.Command, g *globalOptions, o *migrateOptions) error {
 		e:    e,
 		o:    o,
 		open: e.openClusters,
+		uid: func(ctx context.Context, name string) (string, error) {
+			cl, err := e.opener.Open(ctx, e.namespace, name)
+			if err != nil {
+				return "", err
+			}
+			return cl.Info().UID, nil
+		},
 		preflight: func(ctx context.Context) check.Report {
 			opts := o.preflight
 			opts.Aliases = e.aliases
@@ -117,7 +126,9 @@ type migrator struct {
 	o     *migrateOptions
 	phase *migration.Phase
 	// open opens both VMClusters into e.blue and e.green.
-	open      func(context.Context) error
+	open func(context.Context) error
+	// uid returns the UID of the VMCluster name, or an error if it can't be read (e.g. it was deleted).
+	uid       func(ctx context.Context, name string) (string, error)
 	preflight func(context.Context) check.Report
 	newSyncer func() (*migration.Syncer, error)
 	now       func() time.Time
@@ -130,6 +141,13 @@ func (m *migrator) run(ctx context.Context) error {
 		return err
 	}
 	if !st.CompletedAt.IsZero() {
+		// The state belongs to these clusters only if neither was created again since. Blue may be gone by now,
+		// which is fine, so check each VMCluster that still exists on its own.
+		for _, c := range []struct{ name, saved string }{{st.From, st.FromUID}, {st.To, st.ToUID}} {
+			if uid, err := m.uid(ctx, c.name); err == nil && c.saved != "" && uid != c.saved {
+				return &state.ClusterReplacedError{Name: c.name, SavedUID: c.saved, UID: uid}
+			}
+		}
 		m.phase.Set(migration.PhaseDone)
 		fmt.Fprintf(m.e.out, "The migration finished at %s.\n%s\n", st.CompletedAt.UTC().Format(time.RFC3339), done)
 		return nil
@@ -393,7 +411,7 @@ func (m *migrator) backfillStart() (time.Time, error) {
 
 // verifyCopiedDays verifies every full day up to the last synced point that hasn't passed a whole-day verify yet. A
 // day that fails is copied again once and verified again; if it still fails, migrate stops, because green would
-// miss data after the cutover.
+// miss data after the cutover. A day whose queries failed isn't copied again; the next catch-up verifies it again.
 func (m *migrator) verifyCopiedDays(ctx context.Context, syncer *migration.Syncer) error {
 	st, err := m.e.store.Load(ctx)
 	if err != nil {
@@ -429,7 +447,8 @@ func (m *migrator) verifyCopiedDays(ctx context.Context, syncer *migration.Synce
 	return errChecksFailed
 }
 
-// verify verifies the given days and returns those that failed, with the results of those.
+// verify verifies the given days and returns those that failed, with the results of those. It skips a day whose
+// queries failed (logging it), and returns the error when waiting can't fix it, such as a refused request.
 func (m *migrator) verify(ctx context.Context, days []time.Time) ([]time.Time, []check.Result, error) {
 	var failed []time.Time
 	var results []check.Result
@@ -437,6 +456,15 @@ func (m *migrator) verify(ctx context.Context, days []time.Time) ([]time.Time, [
 		r, err := verifyDays(ctx, m.e, m.o.sync.verify, d, d.Add(day))
 		if err != nil {
 			return nil, nil, err
+		}
+		if i := slices.IndexFunc(r, func(res check.Result) bool { return res.Err != nil }); i >= 0 {
+			// A request failed, so the day is unverified, not known to miss data: don't copy it again.
+			if permanent(r[i].Err) {
+				return nil, nil, fmt.Errorf("%s: %w", r[i].Name, r[i].Err)
+			}
+			m.e.log.Warn("can't verify the day, trying again after the next catch-up", "day", state.DayKey(d),
+				"err", r[i].Err)
+			continue
 		}
 		if check.AnyFailed(r) {
 			failed, results = append(failed, d), append(results, r...)
@@ -464,5 +492,7 @@ func unverifiedDays(st *state.State) []time.Time {
 // or missing permissions.
 func permanent(err error) bool {
 	var replaced *state.ClusterReplacedError
-	return errors.As(err, &replaced) || apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err)
+	var refused *cluster.HTTPError
+	return errors.As(err, &replaced) || apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) ||
+		errors.As(err, &refused) && refused.Refused()
 }
