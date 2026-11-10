@@ -220,7 +220,9 @@ that was no cutover: `migrate` clears `cutoverSeenAt` and goes back to catching 
 run; the restarted pod (also one evicted during the final sync) catches up, notices the cutover again and starts the
 final sync at `cutoverSeenAt`, because rows blue delivers late carry timestamps from around it. Failed checks after
 the copy fail the run, and the restarted pod runs the final sync again for the recorded cutover. Every catch-up and
-the completion first open both VMClusters again, so one created again during the migration stops it.
+the completion first open both VMClusters again, so one created again during the migration stops it. Green
+counts as ready only while every full day has a whole-day pass, and before it completes, `migrate` verifies every
+day without one (trying again while queries fail), so a day whose verify timed out is never left unverified.
 
 ```mermaid
 flowchart TD

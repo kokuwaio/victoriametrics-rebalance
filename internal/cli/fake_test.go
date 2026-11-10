@@ -17,11 +17,11 @@ import (
 // fakeCluster is a cluster.Client with one pod per component. vmselect reports series series for every day and
 // samples samples for the metric "up"; each vminsert scrape returns the next body of inserts (the last repeats).
 type fakeCluster struct {
-	name    string
-	series  int64
-	samples float64
-	inserts []string
-	podGets []string
+	name      string
+	series    int64
+	samples   float64
+	inserts   []string
+	podGets   []string
 	podsErr   error // returned by Pods when set
 	selectErr error // returned by SelectGet when set
 }

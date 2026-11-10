@@ -179,8 +179,8 @@ the name. It runs the whole migration:
 3. **Verify.** It verifies every full day it copied. A day that fails is copied again once; if it still fails, the
    Job stops.
 4. **Catch-up.** It copies from the last synced point to now, again and again, and measures blue's and green's
-   writes between the runs. When a run (copy plus verify) takes less than `--ready-after` (10m), it logs
-   `green is ready for the cutover`, and keeps catching up until you cut over.
+   writes between the runs. When a run (copy plus verify) takes less than `--ready-after` (10m) and every full day
+   passed verify, it logs `green is ready for the cutover`, and keeps catching up until you cut over.
 
 How to choose the copy settings (chart values under `copy`; defaults `50MiB/s`, adaptive, 1h chunks):
 
@@ -323,8 +323,8 @@ Keep blue for a few days, so you can roll back. Then:
 Until you delete blue, switch the aliases (and the VMAgents' `remoteWrite`) back to blue. Blue has everything up to
 the switch. To copy what was written to green since then back to blue, run `sync` in the other direction. Start
 before the switch, not at the cutover: the cutover is when migrate noticed the switch, which can be a few minutes
-after it. If you switched after migrate logged that green is ready, as step 5 says, the time `status` shows as Ready comes
-before the switch; otherwise start at the time you merged the switch, or earlier. The copy overlaps what blue
+after it. If you switched after migrate logged that green is ready, as step 5 says, the time `status` shows as Ready
+comes before the switch; otherwise start at the time you merged the switch, or earlier. The copy overlaps what blue
 already has up to the switch, so give blue `dedup.minScrapeInterval: 1ms` on vmstorage and vmselect first, as for
 green in step 2; otherwise those samples are stored twice.
 
@@ -423,8 +423,8 @@ Run `vmrebalance <command> --help` for the full list. The chart sets the flags f
 | Flag | Default | Meaning |
 |---|---|---|
 | `--headroom`, `--rate-window` | `0.2`, `30s` | The `preflight` flags. |
-| `--poll-interval` | `1m` | How often to try again while a VMCluster is missing or a preflight check fails. |
-| `--ready-after` | `10m` | A catch-up (copy plus verify) that takes less than this makes green ready for the cutover. |
+| `--poll-interval` | `1m` | How often to try again while a VMCluster is missing, a preflight check fails, or a day can't be verified before completing. |
+| `--ready-after` | `10m` | A catch-up (copy plus verify) that takes less than this, with every full day verified, makes green ready for the cutover. |
 | `--drain-interval` | `5m` | Blue must receive no rows for this long (at least `1m`); also the window over which the writes are measured to notice the cutover. |
 | `--drain-timeout` | `20m` | How long blue may still receive writes after cutover + `--final-tail`. |
 | `--final-tail` | `15m` | How long after the cutover the final sync waits before the drain check. |
@@ -470,7 +470,9 @@ The Job logs a reason with every failure. The most common ones:
 | `relabeling` warns | Green's vminsert relabels the copied data again. | Make sure the rules don't change their own output, or remove them for the migration. |
 | A chunk fails with an error about `maxExportSeries` | One hour has more series than blue's vmselect exports at once. | Raise `-search.maxExportSeries` on blue's vmselect. |
 | `Green still misses data on these days after copying them again` | A day failed verify, and still fails after copying it again. | Find the cause (for example `-search.maxExportSeries`, or a writer that backfills blue). A new run verifies and copies the failed days again. |
-| `can't verify the day, trying again after the next catch-up` | A query to blue or green failed (for example a timeout), so the day is unverified, not known to miss data. | Nothing: the next catch-up verifies it again, without copying it again. |
+| `can't verify the day, trying again later` | A query to blue or green failed (for example a timeout), so the day is unverified, not known to miss data. | Nothing: the next catch-up verifies it again, without copying it again. migrate declares green ready, and completes, only once every day passed. |
+| `some days aren't verified yet, trying again` | After the final sync, a day still has no whole-day pass because its queries keep failing. | Check blue's and green's vmselect; migrate completes once those days pass. |
+| `days still can't be verified after 10 attempts` | A query fails every time, for example because it hits a vmselect limit such as `-search.maxUniqueTimeseries`. | Find the failing query in the log and raise the limit, then let the pod restart (or run `verify` for those days). |
 | `waiting for the cutover` long after you switched | Blue still receives rows, or green receives none. The log line shows both rates. | Point the remaining writers at green. Blue's vminsert metric `vm_rows_inserted_total` shows the protocol. |
 | `the writers point at green, waiting for the aliases` | The writes moved, but an alias still selects blue. | Switch the alias selectors to green. |
 | `the aliases select green, but blue still receives rows` | Some writer bypasses the aliases. | Find it as above and point it at the alias. |

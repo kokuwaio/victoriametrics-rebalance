@@ -65,8 +65,8 @@ has passed, migrate only reports that the migration is done.`,
 	f.StringVar(&o.since, "since", "", "start the backfill here instead of now - retention (RFC 3339)")
 	f.Float64Var(&o.preflight.Headroom, "headroom", 0.2, "preflight: free space green needs on top of blue's used bytes (0.2 = 20%)")
 	f.DurationVar(&o.preflight.RateWindow, "rate-window", 30*time.Second, "preflight: time between the two scrapes that measure ingestion rates")
-	f.DurationVar(&o.poll, "poll-interval", time.Minute, "how often to try again while a VMCluster is missing or a preflight check fails")
-	f.DurationVar(&o.readyAfter, "ready-after", 10*time.Minute, "a catch-up (copy plus verify) that takes less than this makes green ready for the cutover")
+	f.DurationVar(&o.poll, "poll-interval", time.Minute, "how often to try again while a VMCluster is missing, a preflight check fails or a day can't be verified")
+	f.DurationVar(&o.readyAfter, "ready-after", 10*time.Minute, "a catch-up (copy plus verify) that takes less than this, with every full day verified, makes green ready for the cutover")
 	return cmd
 }
 
@@ -214,7 +214,11 @@ func (m *migrator) run(ctx context.Context) error {
 		}
 		break
 	}
-	// The final checks passed, but they cover only the final window: make sure neither VMCluster was created again.
+	// The final checks passed, but they cover only the final window: make sure every earlier day passed a whole-day
+	// verify (one may have failed to query), then that neither VMCluster was created again meanwhile.
+	if err := m.verifyEveryDay(ctx, syncer); err != nil {
+		return err
+	}
 	if err := m.waitForClusters(ctx); err != nil {
 		return err
 	}
@@ -319,8 +323,14 @@ func (m *migrator) catchUpUntilCutover(ctx context.Context, syncer *migration.Sy
 		if err := m.verifyCopiedDays(ctx, syncer); err != nil {
 			return time.Time{}, err
 		}
-		// Green is as far behind as the copy plus the verify took, including the days the verify copied again.
-		if took := m.now().Sub(began); took < m.o.readyAfter && st.ReadyAt.IsZero() {
+		afterVerify, err := m.e.store.Load(ctx)
+		if err != nil {
+			return time.Time{}, err
+		}
+		// Green is as far behind as the copy plus the verify took, including the days the verify copied again. It
+		// isn't ready while a day is unverified (its queries failed): green may miss data there.
+		took := m.now().Sub(began)
+		if took < m.o.readyAfter && st.ReadyAt.IsZero() && len(unverifiedDays(afterVerify)) == 0 {
 			if _, err := m.e.store.Update(ctx, func(st *state.State) { st.ReadyAt = m.now() }); err != nil {
 				return time.Time{}, err
 			}
@@ -462,7 +472,7 @@ func (m *migrator) verify(ctx context.Context, days []time.Time) ([]time.Time, [
 			if permanent(r[i].Err) {
 				return nil, nil, fmt.Errorf("%s: %w", r[i].Name, r[i].Err)
 			}
-			m.e.log.Warn("can't verify the day, trying again after the next catch-up", "day", state.DayKey(d),
+			m.e.log.Warn("can't verify the day, trying again later", "day", state.DayKey(d),
 				"err", r[i].Err)
 			continue
 		}
@@ -496,3 +506,33 @@ func permanent(err error) bool {
 	return errors.As(err, &replaced) || apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) ||
 		errors.As(err, &refused) && refused.Refused()
 }
+
+// verifyEveryDay verifies the full days that have no whole-day pass yet, and tries again every --poll-interval while
+// a day can't be verified because its queries fail. A day that misses data is copied again once, as in the catch-up.
+func (m *migrator) verifyEveryDay(ctx context.Context, syncer *migration.Syncer) error {
+	for attempt := 1; ; attempt++ {
+		if err := m.verifyCopiedDays(ctx, syncer); err != nil {
+			return err
+		}
+		st, err := m.e.store.Load(ctx)
+		if err != nil {
+			return err
+		}
+		days := unverifiedDays(st)
+		if len(days) == 0 {
+			return nil
+		}
+		if attempt == verifyAttempts {
+			// A query that fails every time (e.g. a vmselect limit) won't pass by waiting longer.
+			return fmt.Errorf("%d days still can't be verified after %d attempts, first %s: check the log for the "+
+				"failing query", len(days), attempt, state.DayKey(days[0]))
+		}
+		m.e.log.Warn("some days aren't verified yet, trying again", "days", len(days), "retry", m.o.poll)
+		if err := m.sleep(ctx, m.o.poll); err != nil {
+			return err
+		}
+	}
+}
+
+// verifyAttempts is how often the final verify of the days without a whole-day pass runs before migrate gives up.
+const verifyAttempts = 10

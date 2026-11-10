@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -456,6 +457,55 @@ func TestMigrateKeepsTheCutoverWhenThePodStopsDuringTheFinalSync(t *testing.T) {
 	}
 }
 
+func TestMigrateIsNotReadyWhileADayIsUnverified(t *testing.T) {
+	tc := newMigrateTest(t)
+	if _, err := tc.e.store.Update(t.Context(), func(s *state.State) {
+		s.BackfillStart, s.SyncedUntil = ts("2026-01-03T00:00:00Z"), ts("2026-01-05T09:59:00Z")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Every query to green times out, and blue keeps receiving writes. Stop after a few catch-ups.
+	tc.green.selectErr = errors.New("context deadline exceeded")
+	tc.blue.inserts = insertSeries(1000, 50)
+	ctx, cancel := context.WithCancel(t.Context())
+	var sleeps atomic.Int32 // blue and green are measured at once
+	tc.m.sleep = func(ctx context.Context, d time.Duration) error {
+		if sleeps.Add(1) > 10 {
+			cancel()
+			return ctx.Err()
+		}
+		return tc.clock.Sleep(ctx, d)
+	}
+
+	if err := tc.m.run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run = %v\n%s", err, tc.out)
+	}
+
+	if st, _ := tc.e.store.Load(t.Context()); !st.ReadyAt.IsZero() {
+		t.Errorf("ready at %s, want not ready while days are unverified", st.ReadyAt)
+	}
+}
+
+func TestMigrateVerifiesEveryDayBeforeItCompletes(t *testing.T) {
+	tc := newMigrateTest(t)
+	// A resumed final sync, while 2026-01-03 and 2026-01-04 have no whole-day pass yet (e.g. their verify timed out).
+	if _, err := tc.e.store.Update(t.Context(), func(s *state.State) {
+		s.BackfillStart, s.SyncedUntil = ts("2026-01-02T10:00:00Z"), ts("2026-01-05T08:50:00Z")
+		s.CutoverAt = ts("2026-01-05T09:00:00Z")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := tc.m.run(t.Context()); err != nil {
+		t.Fatalf("run: %v\n%s", err, tc.out)
+	}
+
+	st, _ := tc.e.store.Load(t.Context())
+	if days := unverifiedDays(st); len(days) != 0 || st.CompletedAt.IsZero() {
+		t.Errorf("unverified days %v, completed at %s; want every day verified before completing", days, st.CompletedAt)
+	}
+}
+
 func TestMigrateResumesTheFinalSyncOfARecordedCutover(t *testing.T) {
 	tc := newMigrateTest(t)
 	cutover := ts("2026-01-05T09:00:00Z")
@@ -546,6 +596,25 @@ func TestMigrateDoesNotCopyADayAgainWhenItsVerifyCouldNotQuery(t *testing.T) {
 				t.Errorf("unverified days = %v, want both days still unverified", unverifiedDays(st))
 			}
 		})
+	}
+}
+
+func TestMigrateGivesUpOnADayWhoseVerifyFailsEveryTime(t *testing.T) {
+	tc := newMigrateTest(t)
+	if _, err := tc.e.store.Update(t.Context(), func(s *state.State) {
+		s.BackfillStart, s.SyncedUntil = ts("2026-01-03T00:00:00Z"), ts("2026-01-05T10:00:00Z")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Green's vmselect answers every query with an error that waiting won't fix, e.g. a limit.
+	tc.green.selectErr = errors.New("422 Unprocessable Entity: the number of matching timeseries exceeds 300000")
+
+	err := tc.m.verifyEveryDay(t.Context(), &migration.Syncer{
+		Copier: tc.copier, Store: tc.e.store, Step: time.Hour, Now: tc.clock.Now, Sleep: tc.clock.Sleep,
+	})
+
+	if err == nil || !strings.Contains(err.Error(), "after 10 attempts") || len(tc.copier.windows) != 0 {
+		t.Errorf("verifyEveryDay = %v, copied %d windows; want it to give up without copying", err, len(tc.copier.windows))
 	}
 }
 
