@@ -1,6 +1,6 @@
 //go:build e2e
 
-// Package e2e runs a full migration on a kind cluster prepared by run.sh.
+// Package e2e runs a full migration with migrate on a kind cluster prepared by run.sh.
 package e2e
 
 import (
@@ -22,6 +22,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/kokuwaio/victoriametrics-rebalance/internal/state"
 	"github.com/kokuwaio/victoriametrics-rebalance/internal/vm"
 )
 
@@ -52,20 +53,23 @@ func TestMigration(t *testing.T) {
 
 	t.Run("preflight", func(t *testing.T) {
 		e := e.on(t)
-		out, err := e.cli("preflight")
+		out, err := e.cli("preflight", "--select-alias=vmselect-active", "--insert-alias=vminsert-active")
 		t.Log(out)
-		if err != nil {
+		if err != nil || !strings.Contains(out, "PASS  alias vminsert") {
 			t.Fatalf("preflight failed: %v", err)
 		}
 	})
 
-	t.Run("sync as a Job from the chart", func(t *testing.T) {
+	t.Run("migrate as a Job from the chart", func(t *testing.T) {
 		e := e.on(t)
-		e.runJob("sync", "copy.retries=1", "copy.backoff=5s", "copy.step=12h", "copy.rateLimit=10MiB/s")
-		if !strings.Contains(e.jobLogs, "serving metrics") {
-			t.Error("the sync Job didn't start its metrics server")
-		}
-		// The Job is done once vmctl has sent the rows; green makes them searchable shortly after.
+		job := e.startJob("aliases.select=vmselect-active", "aliases.insert=vminsert-active", "copy.retries=1", "copy.backoff=5s", "copy.step=12h", "copy.rateLimit=10MiB/s",
+			"final.drainInterval=1m", "final.drainTimeout=5m", "final.tail=1m", "migrate.pollInterval=10s",
+			"verify.topN=5", "verify.randomN=5")
+		e.eventually("green is ready for the cutover", 15*time.Minute, func() bool {
+			return !e.state().ReadyAt.IsZero()
+		})
+
+		// The Job has copied blue's history by now; green makes the rows searchable shortly after.
 		const samples = `sum(count_over_time(e2e_history[4d]))`
 		var blue, green float64
 		e.eventually("green has all of blue's samples", time.Minute, func() bool {
@@ -76,6 +80,28 @@ func TestMigration(t *testing.T) {
 		for _, pod := range []string{"vmstorage-green-0", "vmstorage-green-1"} {
 			if rows := e.storageRows(pod); rows == 0 {
 				t.Errorf("%s holds no rows: the data was not spread across green's nodes", pod)
+			}
+		}
+
+		// Cutover: the aliases select green, and VMAgent drops its second URL, since the alias now reaches green.
+		// The Job notices it and runs the final sync by itself.
+		for _, svc := range []string{"vmselect-active", "vminsert-active"} {
+			if _, err := e.cs.CoreV1().Services(ns).Patch(e.ctx, svc, types.MergePatchType,
+				[]byte(`{"spec":{"selector":{"app.kubernetes.io/instance":"green"}}}`), metav1.PatchOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		patch := `{"spec":{"remoteWrite":[{"url":"http://vminsert-active.monitoring.svc:8480/insert/0/prometheus/api/v1/write"}]}}`
+		if _, err := e.cs.CoreV1().RESTClient().Patch(types.MergePatchType).
+			AbsPath("/apis/operator.victoriametrics.com/v1beta1/namespaces", ns, "vmagents", "agent").
+			Body([]byte(patch)).DoRaw(e.ctx); err != nil {
+			t.Fatal(err)
+		}
+		e.waitJob(job)
+		for _, line := range []string{"serving metrics", "green is ready for the cutover", "the writers point at green",
+			"PASS  alias vmselect", "PASS  alias vminsert", "Done."} {
+			if !strings.Contains(e.jobLogs, line) {
+				t.Errorf("the Job's logs lack %q", line)
 			}
 		}
 	})
@@ -89,26 +115,11 @@ func TestMigration(t *testing.T) {
 		}
 	})
 
-	t.Run("cutover and final sync", func(t *testing.T) {
-		e := e.on(t)
-		// Cutover: VMAgent stops writing to blue.
-		patch := `{"spec":{"remoteWrite":[{"url":"http://vminsert-green.monitoring.svc:8480/insert/0/prometheus/api/v1/write"}]}}`
-		if _, err := e.cs.CoreV1().RESTClient().Patch(types.MergePatchType).
-			AbsPath("/apis/operator.victoriametrics.com/v1beta1/namespaces", ns, "vmagents", "agent").
-			Body([]byte(patch)).DoRaw(e.ctx); err != nil {
-			t.Fatal(err)
-		}
-		// A cutover 15 minutes ago lets the final sync start right away.
-		cutover := time.Now().Add(-15 * time.Minute).UTC().Format(time.RFC3339)
-		e.runJob("final", "final.cutoverAt="+cutover, "final.drainInterval=1m", "final.drainTimeout=5m",
-			"verify.topN=5", "verify.randomN=5")
-	})
-
 	t.Run("status", func(t *testing.T) {
 		e := e.on(t)
 		out, err := e.cli("status")
 		t.Log(out)
-		if err != nil || !strings.Contains(out, "Final sync:") || strings.Contains(out, "Final sync:        -") {
+		if err != nil || !strings.Contains(out, "Completed:") || strings.Contains(out, "Completed:        -") {
 			t.Errorf("status = %v, %q", err, out)
 		}
 	})
@@ -181,12 +192,12 @@ const (
 	chart = "../../charts/vmrebalance"
 )
 
-// runJob installs or upgrades the chart's release in the given mode with the given values (key=value, set as
-// strings), waits for the Job of the new revision and fails the test unless it succeeds.
-func (e *e2e) runJob(mode string, values ...string) {
+// startJob installs or upgrades the chart's release with the given values (key=value, set as strings), and returns
+// the name of the new revision's Job.
+func (e *e2e) startJob(values ...string) string {
 	args := []string{"upgrade", "--install", release, chart, "--namespace", ns,
 		"--set", "image.repository=vmrebalance", "--set", "image.tag=e2e", "--set", "image.pullPolicy=Never",
-		"--set", "from=blue", "--set", "to=green", "--set", "mode=" + mode, "--set", "job.backoffLimit=0"}
+		"--set", "from=blue", "--set", "to=green", "--set", "job.backoffLimit=0"}
 	for _, v := range values {
 		args = append(args, "--set-string", v)
 	}
@@ -203,7 +214,11 @@ func (e *e2e) runJob(mode string, values ...string) {
 	if err := json.Unmarshal(out, &status); err != nil {
 		e.t.Fatalf("decode helm status: %v", err)
 	}
-	name := fmt.Sprintf("%s-%s-%d", release, mode, status.Version)
+	return fmt.Sprintf("%s-%d", release, status.Version)
+}
+
+// waitJob waits for the Job name, keeps its logs in jobLogs and fails the test unless it succeeds.
+func (e *e2e) waitJob(name string) {
 	jobs := e.cs.BatchV1().Jobs(ns)
 	var done *batchv1.Job
 	e.eventually("Job "+name+" finishes", 15*time.Minute, func() bool {
@@ -224,6 +239,19 @@ func (e *e2e) runJob(mode string, values ...string) {
 	if done.Status.Succeeded == 0 {
 		e.t.Fatalf("Job %s failed", name)
 	}
+}
+
+// state reads the migration's state from its ConfigMap; an empty state while there is none yet.
+func (e *e2e) state() state.State {
+	var st state.State
+	cm, err := e.cs.CoreV1().ConfigMaps(ns).Get(e.ctx, "vmrebalance.blue.green", metav1.GetOptions{})
+	if err != nil {
+		return st
+	}
+	if err := json.Unmarshal([]byte(cm.Data["state.json"]), &st); err != nil {
+		e.t.Fatalf("decode state: %v", err)
+	}
+	return st
 }
 
 func (e *e2e) eventually(what string, timeout time.Duration, cond func() bool) {

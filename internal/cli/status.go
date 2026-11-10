@@ -86,12 +86,14 @@ func printStatus(w io.Writer, st *state.State, now time.Time) {
 			fmt.Fprintf(w, "  %s: %v\n", d, st.Verifications[d].Problems)
 		}
 	}
+	row("Ready", "%s", at(st.ReadyAt))
 	row("Cutover", "%s", at(st.CutoverAt))
 	if st.FinalSyncAt.IsZero() {
 		row("Final sync", "-")
 	} else {
 		row("Final sync", "%s (copied %s – %s)", at(st.FinalSyncAt), at(st.FinalStart), at(st.FinalEnd))
 	}
+	row("Completed", "%s", at(st.CompletedAt))
 }
 
 // catchUpETA is how long the copy needs to reach "now" when it is behind seconds behind and has so far copied

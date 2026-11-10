@@ -38,6 +38,8 @@ type PreflightOptions struct {
 	// RateWindow is the time between the two scrapes that measure ingestion rates.
 	RateWindow time.Duration
 	Sleep      Sleeper
+	// Aliases, when configured, must select blue's pods.
+	Aliases Aliases
 }
 
 // Preflight checks that green is ready to receive blue's data.
@@ -67,6 +69,10 @@ func Preflight(ctx context.Context, blue, green cluster.Client, o PreflightOptio
 	capacity(ctx, &r, blue, green, o.Headroom)
 	dualWrite(ctx, &r, blue, green, o)
 	podLabels(ctx, &r, blue, green)
+	if o.Aliases.Configured() {
+		// Until the cutover, readers and writers must reach blue alone: green is still being filled.
+		r.Results = append(r.Results, CheckAliases(ctx, o.Aliases, blue, green, blue, Fail)...)
+	}
 	return r
 }
 
@@ -245,7 +251,7 @@ func dualWrite(ctx context.Context, r *Report, blue, green cluster.Client, o Pre
 		m, err := insertRate(ctx, blue, o.RateWindow, o.Sleep, nil)
 		done <- rate{m.rate, err}
 	}()
-	gm, gerr := insertRate(ctx, green, o.RateWindow, o.Sleep, func(l map[string]string) bool { return l["type"] != "native" })
+	gm, gerr := insertRate(ctx, green, o.RateWindow, o.Sleep, liveWrites)
 	gr := gm.rate
 	b := <-done
 	br := b.v

@@ -38,11 +38,19 @@ type State struct {
 	// Verifications holds the latest verify result per day (key: YYYY-MM-DD, UTC).
 	Verifications map[string]DayResult `json:"verifications,omitempty"`
 
-	CutoverAt   time.Time `json:"cutoverAt,omitzero"`
+	// ReadyAt is when migrate first finished a catch-up within its --ready-after: green is close enough to blue for
+	// the cutover.
+	ReadyAt time.Time `json:"readyAt,omitzero"`
+	// CutoverSeenAt is the first cutover migrate noticed whose final sync failed without finding writes on blue (e.g.
+	// blue couldn't deliver its rows yet). A later final sync starts there, since those rows carry its timestamps.
+	CutoverSeenAt time.Time `json:"cutoverSeenAt,omitzero"`
+	CutoverAt     time.Time `json:"cutoverAt,omitzero"`
 	FinalSyncAt time.Time `json:"finalSyncAt,omitzero"`
 	// FinalStart and FinalEnd are the time range the final sync copied.
 	FinalStart time.Time `json:"finalStart,omitzero"`
 	FinalEnd   time.Time `json:"finalEnd,omitzero"`
+	// CompletedAt is when migrate finished: the final sync copied its window and every check passed.
+	CompletedAt time.Time `json:"completedAt,omitzero"`
 }
 
 // Chunk is one finished copy of a time window.
@@ -161,8 +169,20 @@ func (s *State) clone() *State {
 	return &c
 }
 
-// BindClusters records the VMClusters' UIDs on first use and fails when either changed since: a VMCluster that was
-// deleted and created again under the same name starts empty, so the saved progress doesn't apply to it.
+// ClusterReplacedError means a VMCluster was deleted and created again since the state was saved. Waiting doesn't
+// help: the state has to be deleted.
+type ClusterReplacedError struct {
+	Name, SavedUID, UID string
+}
+
+func (e *ClusterReplacedError) Error() string {
+	return fmt.Sprintf("VMCluster %s was deleted and created again since the state was saved (UID %s, now %s): "+
+		"its progress no longer applies; delete the state to start over", e.Name, e.SavedUID, e.UID)
+}
+
+// BindClusters records the VMClusters' UIDs on first use and fails with a ClusterReplacedError when either changed
+// since: a VMCluster that was deleted and created again under the same name starts empty, so the saved progress
+// doesn't apply to it.
 func BindClusters(ctx context.Context, store Store, fromUID, toUID string) error {
 	if fromUID == "" || toUID == "" {
 		return fmt.Errorf("VMCluster UID unknown (from %q, to %q)", fromUID, toUID)
@@ -173,8 +193,7 @@ func BindClusters(ctx context.Context, store Store, fromUID, toUID string) error
 	}
 	for _, c := range []struct{ name, saved, now string }{{st.From, st.FromUID, fromUID}, {st.To, st.ToUID, toUID}} {
 		if c.saved != "" && c.saved != c.now {
-			return fmt.Errorf("VMCluster %s was deleted and created again since the state was saved (UID %s, now %s): "+
-				"its progress no longer applies; delete the state to start over", c.name, c.saved, c.now)
+			return &ClusterReplacedError{Name: c.name, SavedUID: c.saved, UID: c.now}
 		}
 	}
 	if st.FromUID == fromUID && st.ToUID == toUID {

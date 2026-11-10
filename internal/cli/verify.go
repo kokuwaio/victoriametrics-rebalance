@@ -104,7 +104,7 @@ func verifyRange(since, until string, st *state.State) (time.Time, time.Time, er
 		}
 	} else {
 		if st.BackfillStart.IsZero() {
-			return from, to, errors.New("nothing synced yet: pass --since and --until, or run sync first")
+			return from, to, errors.New("nothing synced yet: pass --since and --until, or run migrate first")
 		}
 		from = firstFullDay(st)
 	}

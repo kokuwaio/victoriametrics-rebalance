@@ -1,6 +1,8 @@
 package migration
 
 import (
+	"sync/atomic"
+
 	"github.com/VictoriaMetrics/metrics"
 )
 
@@ -57,5 +59,43 @@ func (m *Metrics) load(l Load) {
 	if m != nil {
 		m.selectUtil.Set(l.Utilization)
 		m.selectP99.Set(l.QueryP99.Seconds())
+	}
+}
+
+// Phases of a migration, in the order migrate runs them.
+const (
+	PhasePreflight = "preflight"
+	PhaseBackfill  = "backfill"
+	PhaseCatchUp   = "catch-up"
+	PhaseReady     = "ready"
+	PhaseFinal     = "final"
+	PhaseDone      = "done"
+)
+
+// Phase exports the phase migrate is in as vmrebalance_phase{phase="..."}: 1 for the current phase, 0 for the
+// others. A nil *Phase records nothing.
+type Phase struct {
+	current atomic.Value
+}
+
+// NewPhase registers the phase metric in set.
+func NewPhase(set *metrics.Set) *Phase {
+	p := &Phase{}
+	p.current.Store("")
+	for _, name := range []string{PhasePreflight, PhaseBackfill, PhaseCatchUp, PhaseReady, PhaseFinal, PhaseDone} {
+		set.NewGauge(`vmrebalance_phase{phase="`+name+`"}`, func() float64 {
+			if p.current.Load() == name {
+				return 1
+			}
+			return 0
+		})
+	}
+	return p
+}
+
+// Set makes name the current phase.
+func (p *Phase) Set(name string) {
+	if p != nil {
+		p.current.Store(name)
 	}
 }

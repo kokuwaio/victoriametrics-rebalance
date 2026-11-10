@@ -40,7 +40,10 @@ func (f *fakeCluster) Info() cluster.Info {
 }
 
 func (f *fakeCluster) Pods(_ context.Context, c cluster.Component) ([]corev1.Pod, error) {
-	return []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: string(c) + "-" + f.name + "-0", Namespace: "monitoring"}}}, nil
+	return []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{
+		Name: string(c) + "-" + f.name + "-0", Namespace: "monitoring",
+		Labels: map[string]string{"app.kubernetes.io/name": string(c), "app.kubernetes.io/instance": f.name},
+	}}}, nil
 }
 
 func (f *fakeCluster) PodGet(_ context.Context, pod *corev1.Pod, _ cluster.Component, path string) ([]byte, error) {

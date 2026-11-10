@@ -13,6 +13,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/spf13/cobra"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
@@ -33,6 +34,8 @@ type globalOptions struct {
 	access     string
 	stateFile  string
 	verbose    bool
+	// selectAlias and insertAlias name the Services readers and writers use (optional).
+	selectAlias, insertAlias string
 }
 
 // NewRoot returns the vmrebalance root command. version is printed by --version.
@@ -45,7 +48,10 @@ func NewRoot(version string) *cobra.Command {
 nodes, through green's vminsert, so the data ends up spread evenly across all green nodes.
 
 It never deletes data and never changes VMCluster, VMAgent or Service objects: you create green, enable dual
-write and switch the aliases (usually in Git); the tool copies the data, checks every step and says what's due.`,
+write and switch the aliases (usually in Git); the tool copies the data, checks every step and says what's due.
+
+migrate runs the whole migration in one go and notices the cutover by itself. preflight, sync, verify and status
+run single steps.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Version:       version,
@@ -61,10 +67,12 @@ write and switch the aliases (usually in Git); the tool copies the data, checks 
 	f.StringVar(&g.access, "access", "auto", "how to reach vmselect and pods: proxy (through the API server), direct (Service DNS and pod IPs), or auto (direct in a pod, proxy otherwise)")
 	f.StringVar(&g.stateFile, "state-file", "", "keep the state in this local file instead of the ConfigMap vmrebalance.<from>.<to> (with .tenant-<tenant> for tenants other than 0)")
 	f.BoolVarP(&g.verbose, "verbose", "v", false, "log debug output")
+	f.StringVar(&g.selectAlias, "select-alias", "", "Service that readers use for vmselect, e.g. vmselect-active: it must select blue before the cutover and green after it (default: not checked)")
+	f.StringVar(&g.insertAlias, "insert-alias", "", "Service that writers use for vminsert, e.g. vminsert-active: it must select blue before the cutover and green after it (default: not checked)")
 	_ = root.MarkPersistentFlagRequired("from")
 	_ = root.MarkPersistentFlagRequired("to")
 
-	root.AddCommand(newPreflight(g), newSync(g), newVerify(g), newStatus(g))
+	root.AddCommand(newMigrate(g), newPreflight(g), newSync(g), newVerify(g), newStatus(g))
 	return root
 }
 
@@ -89,6 +97,11 @@ type env struct {
 	access      cluster.Access
 	tenant      string
 	blue, green cluster.Client
+	// aliases are the Services readers and writers use, if given.
+	aliases check.Aliases
+	// opener, from and to open the clusters (openClusters).
+	opener   *cluster.Kube
+	from, to string
 }
 
 // setup connects to Kubernetes and opens the state. With clusters, it also opens both VMClusters.
@@ -145,20 +158,42 @@ func (g *globalOptions) setup(cmd *cobra.Command, clusters bool) (*env, error) {
 		e.store = state.NewConfigMap(e.kube, e.namespace, m)
 	}
 
+	e.aliases = check.Aliases{
+		Names: map[cluster.Component]string{cluster.Select: g.selectAlias, cluster.Insert: g.insertAlias},
+		Selector: func(ctx context.Context, name string) (map[string]string, error) {
+			svc, err := e.kube.CoreV1().Services(e.namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			return svc.Spec.Selector, nil
+		},
+	}
+	e.opener = &cluster.Kube{Client: e.kube, Access: e.access, Tenant: g.tenant}
+	e.from, e.to = g.from, g.to
 	if clusters {
-		k := &cluster.Kube{Client: e.kube, Access: e.access, Tenant: g.tenant}
-		if e.blue, err = k.Open(cmd.Context(), e.namespace, g.from); err != nil {
-			return nil, err
-		}
-		if e.green, err = k.Open(cmd.Context(), e.namespace, g.to); err != nil {
-			return nil, err
-		}
-		if err := state.BindClusters(cmd.Context(), e.store, e.blue.Info().UID, e.green.Info().UID); err != nil {
+		if err := e.openClusters(cmd.Context()); err != nil {
 			return nil, err
 		}
 	}
 	e.log.Debug("connected", "namespace", e.namespace, "access", e.access, "from", g.from, "to", g.to)
 	return e, nil
+}
+
+// openClusters opens both VMClusters, and checks that they are the ones the state belongs to.
+func (e *env) openClusters(ctx context.Context) error {
+	blue, err := e.opener.Open(ctx, e.namespace, e.from)
+	if err != nil {
+		return err
+	}
+	green, err := e.opener.Open(ctx, e.namespace, e.to)
+	if err != nil {
+		return err
+	}
+	if err := state.BindClusters(ctx, e.store, blue.Info().UID, green.Info().UID); err != nil {
+		return err
+	}
+	e.blue, e.green = blue, green
+	return nil
 }
 
 // sleep waits for d or until ctx is done.

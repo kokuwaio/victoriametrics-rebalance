@@ -24,6 +24,7 @@ func newPreflight(g *globalOptions) *cobra.Command {
 			if o.RateWindow <= 0 {
 				return errors.New("--rate-window must be positive")
 			}
+			o.Aliases = e.aliases
 			r := check.Preflight(cmd.Context(), e.blue, e.green, o)
 			printReport(e.out, r.Results)
 
@@ -37,10 +38,10 @@ func newPreflight(g *globalOptions) *cobra.Command {
 				}
 			}
 			if r.Failed() {
-				fmt.Fprintln(e.out, "\nFix the failed checks before running sync.")
+				fmt.Fprintln(e.out, "\nFix the failed checks before installing the chart.")
 				return errChecksFailed
 			}
-			fmt.Fprintln(e.out, "\nReady. Next: vmrebalance sync (backfill).")
+			fmt.Fprintln(e.out, "\nReady. Next: install the chart, which runs vmrebalance migrate.")
 			return nil
 		},
 	}

@@ -22,7 +22,7 @@ const dataKey = "state.json"
 
 // Store loads and changes the state. Load returns an empty State (not an error) when nothing was saved yet.
 //
-// Update applies change to the latest stored state and saves it. Several commands may run at once (a sync Job and a
+// Update applies change to the latest stored state and saves it. Several commands may run at once (a migrate Job and a
 // verify from a workstation), so each one changes only its own fields through Update and never writes back a state
 // it loaded earlier.
 type Store interface {

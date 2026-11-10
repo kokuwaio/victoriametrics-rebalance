@@ -11,13 +11,16 @@ safe, because metricIDs can collide across partitions (upstream issues
 
 So `vmrebalance` does a blue/green migration:
 
-1. You create a second VMCluster ("green") with the target number of vmstorage nodes.
+1. You create a second VMCluster ("green") with the target number of vmstorage nodes, and enable dual write.
 2. The tool copies the data from the old cluster ("blue") into green through green's vminsert, which spreads it
-   evenly across all green nodes.
-3. You switch readers and writers to green, the tool runs a last sync, and you delete blue.
+   evenly across all green nodes, and keeps green caught up.
+3. When it says green is ready, you switch readers and writers to green. The tool notices the switch, runs a last
+   sync and verifies it. After a few days you delete blue.
 
-The tool never deletes data and never changes VMCluster, VMAgent or Service objects. You make those changes,
-usually in Git. The tool copies the data, checks every step and tells you what's due next.
+You install the Helm chart once with `from` and `to`; everything else has defaults. Its Job runs
+`vmrebalance migrate`, which does all of the tool's steps on its own. The tool never deletes data and never changes
+VMCluster, VMAgent or Service objects: you make those changes, usually in Git, and the tool waits for them, checks
+them and says what's due next.
 
 **Not in scope:** rebalancing in place (blocked inside vmstorage), freeing blue's disks during the migration (blue
 is deleted as a whole at the end), growing PVCs (the operator already supports that), and changing the Kubernetes
@@ -67,12 +70,12 @@ sync   [ backfill: now-retention ── now ][ catch-up ── Tc ]      [ final
 | 1. Prepare | you | Put stable aliases (Services or VMAuth) in front of vmselect and vminsert. Done once per setup. See [Requirements](#requirements). |
 | 2. Create green | you | A new VMCluster with more vmstorage nodes, the same version, retention and replication factor, plus `dedup.minScrapeInterval: 1ms` on vmstorage and vmselect. |
 | 3. Dual write | you | Add green as a second `remoteWrite` URL on your VMAgent(s). Green now receives most new data live. This is T0. |
-| 4. `preflight` | tool | Checks versions, flags, capacity, dual write and pod labels. |
-| 5. `sync` | tool | Backfill: copies `[now - retention, now]` in resumable chunks. This can take hours to days. |
-| 6. `verify` | tool | Compares blue and green per day. |
-| 7. `sync` | tool | Catch-up: copies from the last synced point to now. Repeat until a run takes only minutes. |
-| 8. Cutover | you | Point the read and write aliases at green. This is Tcut. |
-| 9. `sync --final` | tool | Waits until `Tcut + 15m` and checks that blue no longer receives writes (if it still does, it stops without copying). Then copies `[last synced point - --final-overlap (1h), the moment blue was drained]` (from `Tcut - --final-overlap` if a catch-up already ran past the cutover), waits 30s until green can search the rows, resets green's rollup cache, verifies the copied days, and checks that no earlier verified day still fails. |
+| 4. Install the chart | you | `helm install` with `from` and `to` (and the alias names). It can go into the same change as steps 2 and 3. |
+| 5. Preflight | tool | Waits until both VMClusters exist and every check passes: versions, flags, capacity, dual write, pod labels, aliases. |
+| 6. Backfill | tool | Copies `[now - retention, now]` in resumable chunks, then verifies every full day (a failed day is copied again once). This can take hours to days. |
+| 7. Catch-up | tool | Copies from the last synced point to now, again and again. When a run takes less than `--ready-after` (10m), it logs that green is ready for the cutover. |
+| 8. Cutover | you | Point the read and write aliases at green. |
+| 9. Final sync | tool | Notices the cutover (Tcut): blue receives no rows while green does, and the aliases select green. Waits until `Tcut + 15m`, checks that blue is drained (if blue still receives rows, it copies nothing and goes back to catch-up), copies `[last synced point - 1h, the moment blue was drained]`, waits 30s until green can search the rows, resets green's rollup cache and verifies. Then the Job completes. |
 | 10. Soak and delete | you | Keep blue for a few days so you can roll back, then delete blue and its PVCs. |
 
 Why dual write *and* a final sync:
@@ -88,8 +91,9 @@ Why dual write *and* a final sync:
 
 Rollback until step 10: switch the aliases back to blue. Blue still has everything up to the cutover. To copy data
 written to green after the cutover back to blue, swap `--from` and `--to` and start at the cutover:
-`vmrebalance sync --from vmcluster-b --to vmcluster --since <cutover>`. Without `--since`, the swapped run has a new
-state and would copy green's whole retention.
+`vmrebalance sync --from vmcluster-b --to vmcluster --since <cutover>` (see
+[docs/usage.md](docs/usage.md#rolling-back)). Without `--since`, the swapped run has a new state and would copy
+green's whole retention.
 
 ## Requirements
 
@@ -141,8 +145,8 @@ repository is private, give it a token, for example the GitHub CLI's:
 export MISE_GITHUB_TOKEN="$(gh auth token)"
 ```
 
-`sync` also needs [vmctl](https://docs.victoriametrics.com/victoriametrics/vmctl/) in your `PATH` when it runs
-outside the container image. vmctl ships in the `vmutils` archives of the VictoriaMetrics releases.
+`sync` and `migrate` also need [vmctl](https://docs.victoriametrics.com/victoriametrics/vmctl/) in your `PATH` when
+they run outside the container image. vmctl ships in the `vmutils` archives of the VictoriaMetrics releases.
 
 ### Build from source
 
@@ -162,37 +166,37 @@ same image locally.
 
 ### Helm chart
 
-The chart in [charts/vmrebalance](charts/vmrebalance) runs `sync` as a Job in the namespace of both VMClusters, with
-a ServiceAccount and a Role that has the permissions the tool needs. Every chart version that reaches `main` is
-published to `oci://ghcr.io/kokuwaio/charts/vmrebalance`:
+The chart in [charts/vmrebalance](charts/vmrebalance) runs `vmrebalance migrate` as a Job in the namespace of both
+VMClusters, with a ServiceAccount and a Role that has the permissions the tool needs. Every chart version that
+reaches `main` is published to `oci://ghcr.io/kokuwaio/charts/vmrebalance`. One install runs the whole migration:
 
 ```sh
-helm install vmrebalance oci://ghcr.io/kokuwaio/charts/vmrebalance -n monitoring --set from=vmcluster --set to=vmcluster-b
-helm upgrade vmrebalance oci://ghcr.io/kokuwaio/charts/vmrebalance -n monitoring --reset-then-reuse-values
-helm upgrade vmrebalance oci://ghcr.io/kokuwaio/charts/vmrebalance -n monitoring --reset-then-reuse-values --set mode=final --set-string final.cutoverAt=2026-01-09T10:00:00Z
+helm install vmrebalance oci://ghcr.io/kokuwaio/charts/vmrebalance -n monitoring --set from=vmcluster --set to=vmcluster-b --set aliases.select=vmselect-active --set aliases.insert=vminsert-active
 ```
 
-Every install or upgrade starts one Job, named `<release>-<mode>-<revision>`, and removes the previous one, also
-while it still runs: wait until a run has finished before the next upgrade (`kubectl wait --for=condition=Complete
-job/<name>`). The first Job is the backfill, later upgrades are catch-up runs, and `mode=final` runs the final sync.
+The Job is named `<release>-<revision>` and runs until the migration is done. An upgrade, for example to change the
+rate limit, removes the running Job and starts a new one, which continues from the state.
 `--reset-then-reuse-values` keeps your values but takes the defaults of a newer chart version. The Job is a plain
-resource, not a Helm hook: Helm waits for hook Jobs to finish, and a backfill that takes days would run into the
-upgrade timeout and fail the release. `helm upgrade --wait --wait-for-jobs` waits for a run when you want that, for
-example for the final sync. With Flux, set `disableWaitForJobs` on the HelmRelease's install and upgrade, and change
-a value (for example a pod annotation) to start a new run, since Flux upgrades only when something changed. Tools that
-only render the chart with `helm template`, such as Argo CD, always render revision 1, so the Job name doesn't change
-and they can't start a new run.
-[values.yaml](charts/vmrebalance/values.yaml) lists all settings; [docs/usage.md](docs/usage.md) walks through a
-migration with the chart.
+resource, not a Helm hook: Helm waits for hook Jobs to finish, and a migration that takes days would run into the
+upgrade timeout and fail the release. With Flux, set `disableWaitForJobs` on the HelmRelease's install and upgrade.
+Tools that only render the chart with `helm template`, such as Argo CD, always render revision 1, so the Job name
+doesn't change on an upgrade. [values.yaml](charts/vmrebalance/values.yaml) lists all settings;
+[docs/usage.md](docs/usage.md) walks through a migration with the chart.
 
 ## Usage
 
+The chart runs `migrate` for you. These commands look at a migration from a workstation, at any time:
+
 ```sh
-vmrebalance preflight --namespace monitoring --from vmcluster --to vmcluster-b
-vmrebalance sync      --namespace monitoring --from vmcluster --to vmcluster-b --rate-limit 50MiB/s --adaptive --step 1h
-vmrebalance verify    --namespace monitoring --from vmcluster --to vmcluster-b
+vmrebalance preflight --namespace monitoring --from vmcluster --to vmcluster-b --select-alias vmselect-active --insert-alias vminsert-active
 vmrebalance status    --namespace monitoring --from vmcluster --to vmcluster-b
-vmrebalance sync      --namespace monitoring --from vmcluster --to vmcluster-b --final --cutover-at 2026-01-02T10:00:00Z
+vmrebalance verify    --namespace monitoring --from vmcluster --to vmcluster-b
+```
+
+`sync` copies a time range outside a migration, for example back to blue after a rollback:
+
+```sh
+vmrebalance sync      --namespace monitoring --from vmcluster-b --to vmcluster --since 2026-01-09T10:00:00Z
 ```
 
 [docs/usage.md](docs/usage.md) walks through every step, explains how to choose the rate limit and chunk size,
@@ -200,9 +204,9 @@ and lists all flags. `vmrebalance <command> --help` shows them too.
 
 ### Where to run it
 
-`sync` runs [vmctl](https://docs.victoriametrics.com/victoriametrics/vmctl/) once per chunk. vmctl needs network
-access to blue's vmselect and green's vminsert, so run `sync` as a Job in the cluster with the
-[Helm chart](#helm-chart). Its Job uses the [container image](#container-image), which bundles vmctl.
+`migrate` and `sync` run [vmctl](https://docs.victoriametrics.com/victoriametrics/vmctl/) once per chunk. vmctl
+needs network access to the source's vmselect and the target's vminsert, so run a migration as a Job in the cluster
+with the [Helm chart](#helm-chart). Its Job uses the [container image](#container-image), which bundles vmctl.
 
 From a workstation, port-forward both Services and pass `--from-select-url http://localhost:8481` and
 `--to-insert-url http://localhost:8480`, with `vmctl` in your `PATH`. `preflight`, `verify` and `status` work
@@ -221,20 +225,24 @@ from a workstation without port-forwarding.
   - green's vmstorage nodes have free space for blue's used bytes plus headroom, in total and each node for its
     share;
   - green receives live writes, and which share of blue's (the rest relies on the final sync);
-  - no PodDisruptionBudget or topology spread selector matches pods of both clusters.
+  - no PodDisruptionBudget or topology spread selector matches pods of both clusters;
+  - with `--select-alias` and `--insert-alias`: the alias Services select blue's pods (and only blue's).
 - `verify` only reads from the clusters, so it can run at any time, also during a sync. Per UTC day it compares the
   series count from `/api/v1/status/tsdb` and `count_over_time` sample counts for the top N metric names plus a
   random set (counting every series is too expensive on large clusters). Green passes with at least as many series
   and samples as blue, minus a tolerance (default 1%). On a partial first or last day only the sample counts within
   the range are compared, because the day's series count also includes series outside it.
-- `sync --final`: before copying, blue's vminsert receives no rows during one `--drain-interval` within
+- Cutover: `migrate` takes the cutover as done once blue's vminsert accepts no rows for one `--drain-interval` while
+  green's accepts live writes (both at zero means no writer runs, not a cutover), and the aliases, if set, select
+  green's pods.
+- The final sync: before copying, blue's vminsert receives no rows during one `--drain-interval` within
   `--drain-timeout`, and has delivered every row it accepted (nothing buffered for vmstorage, no rows sent and no
   failed sends during the window, every vmstorage node reachable); otherwise some writer still points at blue or
   rows are still on their way (a window in which a vminsert pod restarted counts as unknown and is measured again).
   After copying, it waits 30 seconds until green has made the rows searchable, then resets the rollup cache on every
   green vmselect pod, so no pod serves results cached before the backfill, and runs `verify` for the days the final
   sync copied, failing on partial responses. It also fails while any day stored in the state failed verify and
-  hasn't passed since.
+  hasn't passed since, or while an alias still selects blue.
 
 ## Risks
 
@@ -247,7 +255,7 @@ from a workstation without port-forwarding.
   limits, `--adaptive` and off-peak hours.
 - **Cost.** A full second copy of the disks, plus vmstorage memory and CPU, for the duration of the migration.
 - **Missed writers.** Anything that bypasses both the aliases and VMAgent writes to blue only, and its data is lost
-  once blue is deleted. The drain check in `sync --final` is what catches it.
+  once blue is deleted. The drain check of the final sync is what catches it.
 
 ## Development
 
@@ -260,9 +268,9 @@ make e2e
 `make check` runs `go vet`, the unit tests with the race detector, and golangci-lint (if installed). `make chart`
 lints the Helm chart with each of its `ci/*-values.yaml` files and validates the manifests with kubeconform (if
 installed). `make e2e` creates a kind cluster with its own kubeconfig (your current context stays untouched),
-installs the operator, two small VMClusters and a VMAgent writing to both, and runs a full migration, with the sync
-Jobs installed from the chart. It needs docker, kind, kubectl and helm. Set `KEEP_CLUSTER=1` to keep the cluster for
-another run. Pull requests run the checks and the end-to-end test; when they change the chart, they also run
+installs the operator, two small VMClusters and a VMAgent writing to both, and runs a full migration, with the
+migrate Job installed from the chart. It needs docker, kind, kubectl and helm. Set `KEEP_CLUSTER=1` to keep the
+cluster for another run. Pull requests run the checks and the end-to-end test; when they change the chart, they also run
 chart-testing (`ct lint`, which also checks that the chart version was bumped) and kubeconform.
 
 ### Releasing

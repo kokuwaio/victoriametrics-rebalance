@@ -17,6 +17,10 @@ rules:
   - apiGroups: [policy]
     resources: [poddisruptionbudgets]
     verbs: [list]
+  # Read the alias Services' selectors (aliases.select, aliases.insert).
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get]
   # Only needed with --access=proxy: reach vmselect and pods through the API server.
   - apiGroups: [""]
     resources: [pods/proxy, services/proxy]

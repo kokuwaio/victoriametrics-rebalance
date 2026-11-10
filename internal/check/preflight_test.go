@@ -138,6 +138,34 @@ func TestPreflightFindsProblems(t *testing.T) {
 	}
 }
 
+func TestPreflightFailsUnlessTheAliasesSelectOnlyBlue(t *testing.T) {
+	services := map[string]map[string]string{
+		"vmselect-active": {"app.kubernetes.io/name": "vmselect"}, // blue's and green's pods
+		"vminsert-active": {"app.kubernetes.io/name": "vminsert", "app.kubernetes.io/instance": "blue"},
+	}
+	blue, green := healthy()
+	o := opts
+	o.Aliases = check.Aliases{
+		Names: map[cluster.Component]string{cluster.Select: "vmselect-active", cluster.Insert: "vminsert-active"},
+		Selector: func(_ context.Context, name string) (map[string]string, error) {
+			return services[name], nil
+		},
+	}
+
+	r := check.Preflight(t.Context(), blue, green, o)
+
+	// Reads through an alias that selects both clusters would also hit green, which is still being filled.
+	if res := result(t, r, "alias vmselect"); res.Level != check.Fail {
+		t.Errorf("alias vmselect = %s %q, want a failure", res.Level, res.Message)
+	}
+	if res := result(t, r, "alias vminsert"); res.Level != check.Pass {
+		t.Errorf("alias vminsert = %s %q", res.Level, res.Message)
+	}
+	if !r.Failed() {
+		t.Error("preflight passed")
+	}
+}
+
 func TestPreflightPodLabelsPassWhenSelectorsUseTheInstanceLabel(t *testing.T) {
 	blue, green := healthy()
 	blue.pdbs = append(blue.pdbs, pdb("vmstorage-blue", map[string]string{
