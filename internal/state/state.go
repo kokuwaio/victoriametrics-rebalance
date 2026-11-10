@@ -41,11 +41,12 @@ type State struct {
 	// ReadyAt is when migrate first finished a catch-up within its --ready-after: green is close enough to blue for
 	// the cutover.
 	ReadyAt time.Time `json:"readyAt,omitzero"`
-	// CutoverSeenAt is the first cutover migrate noticed whose final sync failed without finding writes on blue (e.g.
-	// blue couldn't deliver its rows yet). A later final sync starts there, since those rows carry its timestamps.
+	// CutoverSeenAt is the first cutover migrate noticed, saved before the final sync starts. A final sync after a
+	// restart or a failed drain check starts there, since rows blue delivers late carry its timestamps. It is cleared
+	// when blue is measured receiving writes again (in the drain check or a later measurement): that was no cutover.
 	CutoverSeenAt time.Time `json:"cutoverSeenAt,omitzero"`
 	CutoverAt     time.Time `json:"cutoverAt,omitzero"`
-	FinalSyncAt time.Time `json:"finalSyncAt,omitzero"`
+	FinalSyncAt   time.Time `json:"finalSyncAt,omitzero"`
 	// FinalStart and FinalEnd are the time range the final sync copied.
 	FinalStart time.Time `json:"finalStart,omitzero"`
 	FinalEnd   time.Time `json:"finalEnd,omitzero"`

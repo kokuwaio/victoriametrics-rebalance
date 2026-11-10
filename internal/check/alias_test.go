@@ -16,7 +16,9 @@ func TestCheckAliases(t *testing.T) {
 		"on-green": {"app.kubernetes.io/name": "vmselect", "app.kubernetes.io/instance": "green"},
 		"on-both":  {"app.kubernetes.io/name": "vmselect"},
 		"on-none":  {"app.kubernetes.io/name": "vmselect", "app.kubernetes.io/instance": "other"},
-		"external": {},
+		// Every pod of blue, so requests also reach vminsert and vmstorage pods.
+		"whole-blue": {"app.kubernetes.io/instance": "blue"},
+		"external":   {},
 	}
 	selector := func(_ context.Context, name string) (map[string]string, error) {
 		sel, ok := services[name]
@@ -27,12 +29,13 @@ func TestCheckAliases(t *testing.T) {
 	}
 	blue, green := newCluster("blue", 1), newCluster("green", 2)
 	for alias, want := range map[string]string{
-		"on-blue":  "PASS selects blue's vmselect pods",
-		"on-green": "WARN selects green's vmselect pods; it should select blue's: switch its selector to blue",
-		"on-both":  "WARN selects vmselect pods of [blue green]",
-		"on-none":  "WARN selects no vmselect pods",
-		"external": "WARN has no selector",
-		"missing":  "WARN not found",
+		"on-blue":    "PASS selects blue's vmselect pods",
+		"on-green":   "WARN selects green's vmselect pods; it should select blue's: switch its selector to blue",
+		"on-both":    "WARN selects vmselect pods of [blue green]",
+		"on-none":    "WARN selects no vmselect pods",
+		"external":   "WARN has no selector",
+		"whole-blue": "WARN also selects blue's vmstorage pods; add app.kubernetes.io/name: vmselect to its selector",
+		"missing":    "WARN not found",
 	} {
 		a := check.Aliases{Names: map[cluster.Component]string{cluster.Select: alias}, Selector: selector}
 

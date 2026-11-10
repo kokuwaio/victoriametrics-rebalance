@@ -262,6 +262,99 @@ func TestMigrateKeepsTheFirstCutoverWhenTheDrainCheckFailsWithoutWrites(t *testi
 	}
 }
 
+func TestMigrateStopsWhenPreflightLacksAPermission(t *testing.T) {
+	tc := newMigrateTest(t)
+	forbidden := apierrors.NewForbidden(schema.GroupResource{Resource: "services"}, "vmselect-active", errors.New("rbac"))
+	tc.m.preflight = func(context.Context) check.Report {
+		tc.preflights++
+		return check.Report{Results: []check.Result{
+			{Name: "alias vmselect", Level: check.Fail, Message: forbidden.Error(), Err: forbidden},
+		}}
+	}
+
+	err := tc.m.run(t.Context())
+
+	if !apierrors.IsForbidden(err) || tc.preflights != 1 {
+		t.Errorf("run = %v after %d preflights, want it to stop at the first", err, tc.preflights)
+	}
+}
+
+func TestMigrateStopsWhenGreenIsCreatedAgainDuringTheMigration(t *testing.T) {
+	tc := newMigrateTest(t)
+	tc.blue.inserts = []string{insertMetrics(1000), insertMetrics(1600), insertMetrics(1600)}
+	// Green is deleted and created again once the backfill copied data into it.
+	tc.m.open = func(context.Context) error {
+		if len(tc.copier.windows) > 0 {
+			return &state.ClusterReplacedError{Name: "green", SavedUID: "uid-green", UID: "uid-green-new"}
+		}
+		return nil
+	}
+
+	err := tc.m.run(t.Context())
+
+	var replaced *state.ClusterReplacedError
+	if st, _ := tc.e.store.Load(t.Context()); !errors.As(err, &replaced) || !st.CompletedAt.IsZero() {
+		t.Errorf("run = %v, completed at %s; want it stopped before completing", err, st.CompletedAt)
+	}
+}
+
+func TestMigrateForgetsANoticedCutoverOnceBlueReceivesWritesAgain(t *testing.T) {
+	tc := newMigrateTest(t)
+	// A cutover noticed days ago, then rolled back: blue receives writes again at the first measurement.
+	old := ts("2026-01-01T00:00:00Z")
+	if _, err := tc.e.store.Update(t.Context(), func(s *state.State) { s.CutoverSeenAt = old }); err != nil {
+		t.Fatal(err)
+	}
+	tc.blue.inserts = []string{insertMetrics(1000), insertMetrics(1600), insertMetrics(1600)}
+
+	if err := tc.m.run(t.Context()); err != nil {
+		t.Fatalf("run: %v\n%s", err, tc.out)
+	}
+
+	if st, _ := tc.e.store.Load(t.Context()); !st.CutoverAt.After(old.AddDate(0, 0, 1)) {
+		t.Errorf("cutover at %s, want the new one, not the one before blue received writes again", st.CutoverAt)
+	}
+}
+
+func TestMigrateKeepsTheCutoverWhenThePodStopsDuringTheFinalSync(t *testing.T) {
+	tc := newMigrateTest(t)
+	tc.blue.inserts = []string{insertMetrics(1000), insertMetrics(1600), insertMetrics(1600)}
+	newSyncer := tc.m.newSyncer
+	ctx, evict := context.WithCancel(t.Context())
+	tc.m.newSyncer = func() (*migration.Syncer, error) {
+		s, err := newSyncer()
+		if err != nil {
+			return nil, err
+		}
+		evicted := *s
+		// The pod is evicted while the final sync waits for --final-tail.
+		evicted.Sleep = func(ctx context.Context, d time.Duration) error {
+			if d >= 10*time.Minute {
+				evict()
+				return ctx.Err()
+			}
+			return s.Sleep(ctx, d)
+		}
+		return &evicted, nil
+	}
+
+	if err := tc.m.run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run = %v, want it stopped\n%s", err, tc.out)
+	}
+	stoppedAt := tc.clock.Now()
+
+	// The restarted pod comes up an hour later, catches up and notices the cutover again.
+	tc.clock.Sleep(t.Context(), time.Hour)
+	tc.m.newSyncer = newSyncer
+	if err := tc.m.run(t.Context()); err != nil {
+		t.Fatalf("second run: %v\n%s", err, tc.out)
+	}
+
+	if st, _ := tc.e.store.Load(t.Context()); !st.CutoverAt.Before(stoppedAt) {
+		t.Errorf("cutover at %s, want the one noticed before the pod stopped at %s", st.CutoverAt, stoppedAt)
+	}
+}
+
 func TestMigrateResumesTheFinalSyncOfARecordedCutover(t *testing.T) {
 	tc := newMigrateTest(t)
 	cutover := ts("2026-01-05T09:00:00Z")

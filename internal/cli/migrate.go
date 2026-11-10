@@ -156,10 +156,21 @@ func (m *migrator) run(ctx context.Context) error {
 			if cutover, err = m.catchUpUntilCutover(ctx, syncer); err != nil {
 				return err
 			}
-			if seen := st.CutoverSeenAt; !seen.IsZero() && seen.Before(cutover) {
-				m.e.log.Info("starting the final sync at the cutover noticed before the last drain check failed",
-					"cutover", seen.UTC().Format(time.RFC3339))
-				cutover = seen
+			// Keep the first cutover noticed, so a final sync after a restart or a failed drain check still starts
+			// there: rows blue delivers late carry its timestamps.
+			noticed := cutover
+			saved, err := m.e.store.Update(ctx, func(s *state.State) {
+				if s.CutoverSeenAt.IsZero() || noticed.Before(s.CutoverSeenAt) {
+					s.CutoverSeenAt = noticed
+				}
+			})
+			if err != nil {
+				return err
+			}
+			cutover = saved.CutoverSeenAt
+			if cutover.Before(noticed) {
+				m.e.log.Info("starting the final sync at the cutover noticed before the restart or the failed drain check",
+					"cutover", cutover.UTC().Format(time.RFC3339))
 			}
 		}
 		m.phase.Set(migration.PhaseFinal)
@@ -169,7 +180,7 @@ func (m *migrator) run(ctx context.Context) error {
 			m.e.log.Warn("blue still receives writes, so the cutover isn't done: catching up until the writers point at green",
 				"check", results[0].Message)
 			// The writers hadn't all moved, so this was no cutover.
-			if st, err = m.e.store.Update(ctx, func(st *state.State) { st.CutoverSeenAt = time.Time{} }); err != nil {
+			if _, err := m.e.store.Update(ctx, func(st *state.State) { st.CutoverSeenAt = time.Time{} }); err != nil {
 				return err
 			}
 			cutover = time.Time{}
@@ -179,17 +190,15 @@ func (m *migrator) run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if drain := results[0]; drain.Name == check.Drain && drain.Level == check.Fail {
-			// The drain check failed without writes on blue: keep the cutover for the restarted pod.
-			if _, err := m.e.store.Update(ctx, func(st *state.State) { st.CutoverSeenAt = cutover }); err != nil {
-				return err
-			}
-		}
 		if check.AnyFailed(results) {
 			fmt.Fprintln(m.e.out, "\n"+notDone)
 			return errChecksFailed
 		}
 		break
+	}
+	// The final checks passed, but they cover only the final window: make sure neither VMCluster was created again.
+	if err := m.waitForClusters(ctx); err != nil {
+		return err
 	}
 	if _, err := m.e.store.Update(ctx, func(st *state.State) { st.CompletedAt = m.now() }); err != nil {
 		return err
@@ -208,8 +217,7 @@ func (m *migrator) waitForClusters(ctx context.Context) error {
 		if err == nil {
 			return nil
 		}
-		var replaced *state.ClusterReplacedError
-		if errors.As(err, &replaced) || apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) {
+		if permanent(err) {
 			return err
 		}
 		m.e.log.Warn("waiting for both VMClusters", "err", err, "retry", m.o.poll)
@@ -245,9 +253,14 @@ func (m *migrator) waitForPreflight(ctx context.Context) error {
 			return nil
 		}
 		for _, res := range r.Results {
-			if res.Level == check.Fail {
-				m.e.log.Warn("preflight check failed", "check", res.Name, "message", res.Message)
+			if res.Level != check.Fail {
+				continue
 			}
+			if permanent(res.Err) {
+				printReport(m.e.out, r.Results)
+				return fmt.Errorf("preflight check %s: %w", res.Name, res.Err)
+			}
+			m.e.log.Warn("preflight check failed", "check", res.Name, "message", res.Message)
 		}
 		m.e.log.Info("waiting until every preflight check passes", "retry", m.o.poll)
 		if err := m.sleep(ctx, m.o.poll); err != nil {
@@ -260,6 +273,10 @@ func (m *migrator) waitForPreflight(ctx context.Context) error {
 // blue receives no more rows while green still does. It returns the start of that measurement as the cutover.
 func (m *migrator) catchUpUntilCutover(ctx context.Context, syncer *migration.Syncer) (time.Time, error) {
 	for {
+		// Open the VMClusters again before every copy: one created again since would make the state wrong.
+		if err := m.waitForClusters(ctx); err != nil {
+			return time.Time{}, err
+		}
 		st, err := m.e.store.Load(ctx)
 		if err != nil {
 			return time.Time{}, err
@@ -315,6 +332,12 @@ func (m *migrator) catchUpUntilCutover(ctx context.Context, syncer *migration.Sy
 			return at, nil
 		default:
 			args := []any{"blueRowsPerSecond", int64(w.BlueRate), "greenRowsPerSecond", int64(w.GreenRate)}
+			if w.BlueRate > 0 && !st.CutoverSeenAt.IsZero() {
+				// Blue receives writes again (e.g. after a rollback): the cutover noticed earlier no longer holds.
+				if _, err := m.e.store.Update(ctx, func(s *state.State) { s.CutoverSeenAt = time.Time{} }); err != nil {
+					return time.Time{}, err
+				}
+			}
 			if m.e.aliases.Configured() && len(m.aliasesNotOnGreen(ctx)) == 0 {
 				m.e.log.Warn("the aliases select green, but blue still receives rows: some writer bypasses the "+
 					"aliases; point it at green", args...)
@@ -417,4 +440,11 @@ func unverifiedDays(st *state.State) []time.Time {
 		}
 	}
 	return days
+}
+
+// permanent reports whether err is one that waiting can't fix: a VMCluster created again since the state was saved,
+// or missing permissions.
+func permanent(err error) bool {
+	var replaced *state.ClusterReplacedError
+	return errors.As(err, &replaced) || apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err)
 }

@@ -321,8 +321,12 @@ Keep blue for a few days, so you can roll back. Then:
 ## Rolling back
 
 Until you delete blue, switch the aliases (and the VMAgents' `remoteWrite`) back to blue. Blue has everything up to
-the cutover. To copy what was written to green after the cutover back to blue, run `sync` in the other direction,
-starting at the cutover (the time is in `status`):
+the switch. To copy what was written to green since then back to blue, run `sync` in the other direction. Start
+before the switch, not at the cutover: the cutover is when migrate noticed the switch, which can be a few minutes
+after it. If you switched after migrate logged that green is ready, as step 5 says, the time `status` shows as Ready comes
+before the switch; otherwise start at the time you merged the switch, or earlier. The copy overlaps what blue
+already has up to the switch, so give blue `dedup.minScrapeInterval: 1ms` on vmstorage and vmselect first, as for
+green in step 2; otherwise those samples are stored twice.
 
 ```sh
 vmrebalance sync -n monitoring --from vmcluster-b --to vmcluster --since 2026-01-09T10:00:00Z --rate-limit 20MiB/s --from-select-url http://localhost:8481 --to-insert-url http://localhost:8480
@@ -462,7 +466,7 @@ The Job logs a reason with every failure. The most common ones:
 | `capacity` fails | Green has too little free disk, in total or on one node. | Larger PVCs, or more vmstorage nodes. |
 | `green receives no live writes` | Dual write isn't set up. | Add green's URL to every VMAgent's `remoteWrite` (step 3). |
 | `PodDisruptionBudget ... selects pods of both clusters` or `topologySpreadConstraints` | Blue and green pods are counted together. | Add `app.kubernetes.io/instance` to the selector. |
-| `alias ...` fails | The alias Service is missing, has no selector, or selects the wrong cluster's pods (or both). | Fix its selector: `app.kubernetes.io/name` plus `app.kubernetes.io/instance` of the active cluster. |
+| `alias ...` fails | The alias Service is missing, has no selector, or selects the wrong cluster's pods (or both), or also pods of another component. | Fix its selector: `app.kubernetes.io/name` plus `app.kubernetes.io/instance` of the active cluster. |
 | `relabeling` warns | Green's vminsert relabels the copied data again. | Make sure the rules don't change their own output, or remove them for the migration. |
 | A chunk fails with an error about `maxExportSeries` | One hour has more series than blue's vmselect exports at once. | Raise `-search.maxExportSeries` on blue's vmselect. |
 | `Green still misses data on these days after copying them again` | A day failed verify, and still fails after copying it again. | Find the cause (for example `-search.maxExportSeries`, or a writer that backfills blue). A new run verifies and copies the failed days again. |
@@ -472,7 +476,7 @@ The Job logs a reason with every failure. The most common ones:
 | `blue still receives writes, so the cutover isn't done` | The final sync's drain check found writes on blue after `--final-tail`. Nothing was copied. | The Job goes back to catching up; point the remaining writers at green. |
 | `vminsert pods restarted, changed or were terminating during every measurement` | The drain check couldn't measure: a pod restarted, or is shutting down and may still send rows. Nothing was copied, and the run fails. | Wait until blue's vminsert pods are stable; the restarted pod tries again. A pod stuck terminating (e.g. on a lost node) blocks the check until it is deleted. |
 | `still fail to send to a vmstorage node` or `were still delivering rows` | Blue's vminsert still holds rows it accepted. Nothing was copied, and the run fails. | Fix blue's vmstorage nodes; the restarted pod tries again. |
-| `forbidden` or `Unauthorized` while opening the VMClusters | The ServiceAccount lacks a permission. Waiting can't fix that, so the run fails at once (and every restart again). | Fix the Role (`rbac.create`). |
+| `forbidden` or `Unauthorized` while opening the VMClusters or in a preflight check | The ServiceAccount lacks a permission. Waiting can't fix that, so the run fails at once (and every restart again). | Fix the Role (`rbac.create`), or the auth key of the VictoriaMetrics component that refused the request. |
 | `earlier verify` fails | A day failed verify earlier, and no later verify of that time range passed. | `verify --since <day> --until <next day>`; if green really misses data, copy the day again with `sync` and its own `--state-file`, `--since` and `--until`. |
 | `state belongs to the migration ...` | The state is for other clusters or another tenant. | Check `from`, `to`, `tenant` and `--state-file`. |
 | `VMCluster ... was deleted and created again` | The saved progress belongs to a cluster that no longer exists. The run fails at once (and every restart again). | Delete the state to start over. |

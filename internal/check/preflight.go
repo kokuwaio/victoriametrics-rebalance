@@ -97,12 +97,12 @@ func versions(ctx context.Context, r *Report, blue, green cluster.Client) {
 	for _, c := range cluster.Components {
 		bt, err := imageTags(ctx, blue, c)
 		if err != nil {
-			r.add(Version, Fail, "%v", err)
+			r.fail(Version, err)
 			return
 		}
 		gt, err := imageTags(ctx, green, c)
 		if err != nil {
-			r.add(Version, Fail, "%v", err)
+			r.fail(Version, err)
 			return
 		}
 		if len(bt) != 1 || !slices.Equal(bt, gt) {
@@ -205,12 +205,12 @@ func relabeling(r *Report, g cluster.Info) {
 func capacity(ctx context.Context, r *Report, blue, green cluster.Client, headroom float64) {
 	used, err := scrape(ctx, blue, cluster.Storage, "vm_data_size_bytes", nil)
 	if err != nil {
-		r.add(Capacity, Fail, "%v", err)
+		r.fail(Capacity, err)
 		return
 	}
 	free, err := scrape(ctx, green, cluster.Storage, "vm_free_disk_space_bytes", nil)
 	if err != nil {
-		r.add(Capacity, Fail, "%v", err)
+		r.fail(Capacity, err)
 		return
 	}
 	u, f := total(used), total(free)
@@ -256,7 +256,7 @@ func dualWrite(ctx context.Context, r *Report, blue, green cluster.Client, o Pre
 	b := <-done
 	br := b.v
 	if err := firstErr(b.err, gerr); err != nil {
-		r.add(DualWrite, Fail, "%v", err)
+		r.fail(DualWrite, err)
 		return
 	}
 	if gr == 0 {
@@ -291,12 +291,12 @@ func firstErr(errs ...error) error {
 func podLabels(ctx context.Context, r *Report, blue, green cluster.Client) {
 	bluePods, err := allPods(ctx, blue)
 	if err != nil {
-		r.add(PodLabels, Fail, "%v", err)
+		r.fail(PodLabels, err)
 		return
 	}
 	greenPods, err := allPods(ctx, green)
 	if err != nil {
-		r.add(PodLabels, Fail, "%v", err)
+		r.fail(PodLabels, err)
 		return
 	}
 	var problems []string
@@ -310,7 +310,7 @@ func podLabels(ctx context.Context, r *Report, blue, green cluster.Client) {
 	for _, c := range []cluster.Client{blue, green} {
 		pdbs, err := c.PDBs(ctx)
 		if err != nil {
-			r.add(PodLabels, Fail, "list PodDisruptionBudgets: %v", err)
+			r.fail(PodLabels, fmt.Errorf("list PodDisruptionBudgets: %w", err))
 			return
 		}
 		for _, p := range pdbs {

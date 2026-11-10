@@ -214,11 +214,13 @@ up to the moment the check passed, so samples from a writer that stopped late ar
 already ran past the cutover, its window starts at `Tcut - 1h` instead of `SyncedUntil - 1h` (1h is the default of
 `--final-overlap`, which must cover the oldest timestamps that writers bypassing dual write still send), so the time
 around the cutover is always copied and verified. A rerun with the same cutover keeps the first run's window start,
-so a day that failed to verify is copied and verified again. A failed drain check copies nothing. When blue still
-received rows, `migrate` goes back to catching up. Any other drain failure fails the run and records the cutover as
-`cutoverSeenAt`; the restarted pod catches up, notices the cutover again and starts the final sync at the recorded
-one, because rows blue delivers late carry timestamps from around it. Failed checks after the copy fail the run,
-and the restarted pod runs the final sync again for the recorded cutover.
+so a day that failed to verify is copied and verified again. `migrate` records the first cutover it notices as
+`cutoverSeenAt` before the final sync starts. A failed drain check copies nothing. When blue still received rows,
+that was no cutover: `migrate` clears `cutoverSeenAt` and goes back to catching up. Any other drain failure fails the
+run; the restarted pod (also one evicted during the final sync) catches up, notices the cutover again and starts the
+final sync at `cutoverSeenAt`, because rows blue delivers late carry timestamps from around it. Failed checks after
+the copy fail the run, and the restarted pod runs the final sync again for the recorded cutover. Every catch-up and
+the completion first open both VMClusters again, so one created again during the migration stops it.
 
 ```mermaid
 flowchart TD
@@ -253,7 +255,7 @@ created again under the same name (the state records both UIDs).
 | `chunks` | `migrate`, `sync` | History of finished chunks (window, bytes, seconds), capped at the last 500. Only `status` reads it. |
 | `verifications` | `verify`, `migrate` | The latest result per UTC day. |
 | `readyAt` | `migrate` | When a catch-up first took less than `--ready-after`. |
-| `cutoverSeenAt` | `migrate` | The cutover of a final sync whose drain check failed without writes on blue. The next final sync starts there. |
+| `cutoverSeenAt` | `migrate` | The first cutover noticed, saved before the final sync. A final sync after a restart starts there; cleared when blue receives writes again. |
 | `cutoverAt`, `finalStart`, `finalEnd`, `finalSyncAt` | `migrate` | The cutover time and the window the final sync copied. A rerun clears `finalSyncAt` until its copy finishes. |
 | `completedAt` | `migrate` | When the final sync passed every check. A later `migrate` only reports that it is done. |
 

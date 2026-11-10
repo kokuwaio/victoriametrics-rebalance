@@ -44,7 +44,7 @@ func CheckAliases(ctx context.Context, a Aliases, blue, green, want cluster.Clie
 		res := Result{Name: "alias " + string(c), Level: miss}
 		switch selects, err := aliasTargets(ctx, a, name, c, blue, green); {
 		case err != nil:
-			res.Message = fmt.Sprintf("Service %s: %v", name, err)
+			res.Message, res.Err = fmt.Sprintf("Service %s: %v", name, err), err
 		case len(selects) == 1 && selects[0] == want.Info().Name:
 			res.Level, res.Message = Pass, fmt.Sprintf("Service %s selects %s's %s pods", name, want.Info().Name, c)
 		case len(selects) == 0:
@@ -62,7 +62,8 @@ func CheckAliases(ctx context.Context, a Aliases, blue, green, want cluster.Clie
 	return results
 }
 
-// aliasTargets returns the names of the clusters whose pods of component c the Service name selects.
+// aliasTargets returns the names of the clusters whose pods of component c the Service name selects. It fails when
+// the Service also selects pods of another component, which can't answer c's requests.
 func aliasTargets(ctx context.Context, a Aliases, name string, c cluster.Component, clusters ...cluster.Client) ([]string, error) {
 	sel, err := a.Selector(ctx, name)
 	if err != nil {
@@ -75,11 +76,18 @@ func aliasTargets(ctx context.Context, a Aliases, name string, c cluster.Compone
 	s := labels.SelectorFromSet(sel)
 	var out []string
 	for _, cl := range clusters {
-		pods, err := cl.Pods(ctx, c)
-		if err != nil {
-			return nil, err
-		}
-		if slices.ContainsFunc(pods, func(p corev1.Pod) bool { return s.Matches(labels.Set(p.Labels)) }) {
+		for _, comp := range cluster.Components {
+			pods, err := cl.Pods(ctx, comp)
+			if err != nil {
+				return nil, err
+			}
+			if !slices.ContainsFunc(pods, func(p corev1.Pod) bool { return s.Matches(labels.Set(p.Labels)) }) {
+				continue
+			}
+			if comp != c {
+				return nil, fmt.Errorf("also selects %s's %s pods; add app.kubernetes.io/name: %s to its selector",
+					cl.Info().Name, comp, c)
+			}
 			out = append(out, cl.Info().Name)
 		}
 	}

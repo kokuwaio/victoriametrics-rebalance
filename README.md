@@ -89,9 +89,10 @@ Why dual write *and* a final sync:
   share an exact timestamp. Without it, overlaps would be stored twice and would skew `count_over_time` and similar
   functions.
 
-Rollback until step 10: switch the aliases back to blue. Blue still has everything up to the cutover. To copy data
-written to green after the cutover back to blue, swap `--from` and `--to` and start at the cutover:
-`vmrebalance sync --from vmcluster-b --to vmcluster --since <cutover>` (see
+Rollback until step 10: switch the aliases back to blue. Blue still has everything up to the switch. To copy data
+written to green since then back to blue, swap `--from` and `--to` and start before the switch, e.g. at the time
+`status` shows as Ready if you switched after it: `vmrebalance sync --from vmcluster-b --to vmcluster --since <ready>`.
+Give blue `dedup.minScrapeInterval: 1ms` first, or the overlap is stored twice (see
 [docs/usage.md](docs/usage.md#rolling-back)). Without `--since`, the swapped run has a new state and would copy
 green's whole retention.
 
