@@ -44,7 +44,7 @@ the tool works and why it is built this way.
   a ConfigMap costs nothing extra and survives restarts of a Job's pod.
 - **One tenant per run.** The tool copies the tenant in `--tenant` (default `0`), through
   `/select/<tenant>/prometheus` on blue and `/insert/<tenant>/prometheus` on green. Copying all tenants at once
-  (vmctl's `--vm-intercluster`) is on the [roadmap](roadmap.md).
+  (vmctl's `--vm-intercluster`) isn't supported; run one migration per tenant.
 
 ## System context
 
@@ -254,7 +254,7 @@ created again under the same name (the state records both UIDs).
 | `syncedUntil` | `migrate`, `sync` | End of the last finished chunk. The next sync continues here. |
 | `chunks` | `migrate`, `sync` | History of finished chunks (window, bytes, seconds), capped at the last 500. Only `status` reads it. |
 | `verifications` | `verify`, `migrate` | The latest result per UTC day. |
-| `readyAt` | `migrate` | When a catch-up first took less than `--ready-after`. |
+| `readyAt` | `migrate` | When a catch-up (copy plus verify) first took less than `--ready-after`. |
 | `cutoverSeenAt` | `migrate` | The first cutover noticed, saved before the final sync. A final sync after a restart starts there; cleared when blue receives writes again. |
 | `cutoverAt`, `finalStart`, `finalEnd`, `finalSyncAt` | `migrate` | The cutover time and the window the final sync copied. A rerun clears `finalSyncAt` until its copy finishes. |
 | `completedAt` | `migrate` | When the final sync passed every check. A later `migrate` only reports that it is done. |

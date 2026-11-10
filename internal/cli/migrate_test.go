@@ -279,6 +279,65 @@ func TestMigrateStopsWhenPreflightLacksAPermission(t *testing.T) {
 	}
 }
 
+func TestMigrateStopsAResumedRunThatLacksAPermission(t *testing.T) {
+	forbidden := apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "", errors.New("rbac"))
+	for name, deny := range map[string]func(*migrateTest){
+		"listing blue's pods to measure the writes": func(tc *migrateTest) { tc.blue.podsErr = forbidden },
+		"reading an alias": func(tc *migrateTest) {
+			tc.blue.inserts = []string{insertMetrics(1000), insertMetrics(1000)}
+			tc.e.aliases = check.Aliases{
+				Names:    map[cluster.Component]string{cluster.Select: "vmselect-active"},
+				Selector: func(context.Context, string) (map[string]string, error) { return nil, forbidden },
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tc := newMigrateTest(t)
+			// The backfill ran before, so the restarted pod skips preflight.
+			if _, err := tc.e.store.Update(t.Context(), func(s *state.State) {
+				s.BackfillStart, s.SyncedUntil = ts("2026-01-04T10:00:00Z"), ts("2026-01-05T09:50:00Z")
+				s.Verifications = map[string]state.DayResult{"2026-01-04": {Pass: true, Partial: true}}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			deny(tc)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+
+			err := tc.m.run(ctx)
+
+			if !apierrors.IsForbidden(err) {
+				t.Errorf("run = %v, want it to stop on the missing permission", err)
+			}
+		})
+	}
+}
+
+func TestMigrateCountsTheVerifyOfACatchUpTowardsReady(t *testing.T) {
+	tc := newMigrateTest(t)
+	tc.m.o.readyAfter = 90 * time.Second
+	if _, err := tc.e.store.Update(t.Context(), func(s *state.State) {
+		s.BackfillStart, s.SyncedUntil = ts("2026-01-02T10:00:00Z"), ts("2026-01-05T09:59:00Z")
+		s.Verifications = map[string]state.DayResult{"2026-01-03": {Pass: true}}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 2026-01-04 fails verify until it is copied again: the first catch-up copies for a minute, then copies that day
+	// again for another minute. Blue receives writes until the second measurement.
+	tc.green.samples = 50
+	tc.copier.onCopy = func(migration.Window) { tc.green.samples = 100 }
+	tc.blue.inserts = []string{insertMetrics(1000), insertMetrics(1600), insertMetrics(1600)}
+
+	if err := tc.m.run(t.Context()); err != nil {
+		t.Fatalf("run: %v\n%s", err, tc.out)
+	}
+
+	// Ready only after the second catch-up: the first one took 2 minutes in all, longer than --ready-after.
+	if st, _ := tc.e.store.Load(t.Context()); !st.ReadyAt.After(ts("2026-01-05T10:03:00Z")) {
+		t.Errorf("ready at %s, want it after the second catch-up", st.ReadyAt)
+	}
+}
+
 func TestMigrateStopsWhenGreenIsCreatedAgainDuringTheMigration(t *testing.T) {
 	tc := newMigrateTest(t)
 	tc.blue.inserts = []string{insertMetrics(1000), insertMetrics(1600), insertMetrics(1600)}

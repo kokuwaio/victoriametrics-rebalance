@@ -179,7 +179,7 @@ the name. It runs the whole migration:
 3. **Verify.** It verifies every full day it copied. A day that fails is copied again once; if it still fails, the
    Job stops.
 4. **Catch-up.** It copies from the last synced point to now, again and again, and measures blue's and green's
-   writes between the runs. When a run takes less than `--ready-after` (10m), it logs
+   writes between the runs. When a run (copy plus verify) takes less than `--ready-after` (10m), it logs
    `green is ready for the cutover`, and keeps catching up until you cut over.
 
 How to choose the copy settings (chart values under `copy`; defaults `50MiB/s`, adaptive, 1h chunks):
@@ -424,7 +424,7 @@ Run `vmrebalance <command> --help` for the full list. The chart sets the flags f
 |---|---|---|
 | `--headroom`, `--rate-window` | `0.2`, `30s` | The `preflight` flags. |
 | `--poll-interval` | `1m` | How often to try again while a VMCluster is missing or a preflight check fails. |
-| `--ready-after` | `10m` | A catch-up that takes less than this makes green ready for the cutover. |
+| `--ready-after` | `10m` | A catch-up (copy plus verify) that takes less than this makes green ready for the cutover. |
 | `--drain-interval` | `5m` | Blue must receive no rows for this long (at least `1m`); also the window over which the writes are measured to notice the cutover. |
 | `--drain-timeout` | `20m` | How long blue may still receive writes after cutover + `--final-tail`. |
 | `--final-tail` | `15m` | How long after the cutover the final sync waits before the drain check. |
@@ -476,7 +476,7 @@ The Job logs a reason with every failure. The most common ones:
 | `blue still receives writes, so the cutover isn't done` | The final sync's drain check found writes on blue after `--final-tail`. Nothing was copied. | The Job goes back to catching up; point the remaining writers at green. |
 | `vminsert pods restarted, changed or were terminating during every measurement` | The drain check couldn't measure: a pod restarted, or is shutting down and may still send rows. Nothing was copied, and the run fails. | Wait until blue's vminsert pods are stable; the restarted pod tries again. A pod stuck terminating (e.g. on a lost node) blocks the check until it is deleted. |
 | `still fail to send to a vmstorage node` or `were still delivering rows` | Blue's vminsert still holds rows it accepted. Nothing was copied, and the run fails. | Fix blue's vmstorage nodes; the restarted pod tries again. |
-| `forbidden` or `Unauthorized` while opening the VMClusters or in a preflight check | The ServiceAccount lacks a permission. Waiting can't fix that, so the run fails at once (and every restart again). | Fix the Role (`rbac.create`), or the auth key of the VictoriaMetrics component that refused the request. |
+| `forbidden` or `Unauthorized` while opening the VMClusters, in a preflight check, while measuring the writes or reading an alias | The ServiceAccount lacks a permission. Waiting can't fix that, so the run fails at once (and every restart again). | Fix the Role (`rbac.create`), or the auth key of the VictoriaMetrics component that refused the request. |
 | `earlier verify` fails | A day failed verify earlier, and no later verify of that time range passed. | `verify --since <day> --until <next day>`; if green really misses data, copy the day again with `sync` and its own `--state-file`, `--since` and `--until`. |
 | `state belongs to the migration ...` | The state is for other clusters or another tenant. | Check `from`, `to`, `tenant` and `--state-file`. |
 | `VMCluster ... was deleted and created again` | The saved progress belongs to a cluster that no longer exists. The run fails at once (and every restart again). | Delete the state to start over. |

@@ -40,8 +40,8 @@ each of these changes and notices them by itself.
 2. Backfill: copies [now - retention, now] (or from --since), then verifies every full day it copied. A day that
    fails is copied again once; if it still fails, migrate stops.
 3. Catch-up: copies from the last synced point to now, again and again. After each run it measures blue's and
-   green's writes for --drain-interval. Once a run takes less than --ready-after, it logs that green is ready for
-   the cutover (and records it in the state and the vmrebalance_phase metric).
+   green's writes for --drain-interval. Once a run (copy plus verify) takes less than --ready-after, it logs that
+   green is ready for the cutover (and records it in the state and the vmrebalance_phase metric).
 4. Cutover: you switch the read and write aliases to green. migrate sees blue receive no more rows while green
    still does, and takes that moment as the cutover time. With --select-alias and --insert-alias, it also waits
    until both Services select green's pods.
@@ -64,7 +64,7 @@ has passed, migrate only reports that the migration is done.`,
 	f.Float64Var(&o.preflight.Headroom, "headroom", 0.2, "preflight: free space green needs on top of blue's used bytes (0.2 = 20%)")
 	f.DurationVar(&o.preflight.RateWindow, "rate-window", 30*time.Second, "preflight: time between the two scrapes that measure ingestion rates")
 	f.DurationVar(&o.poll, "poll-interval", time.Minute, "how often to try again while a VMCluster is missing or a preflight check fails")
-	f.DurationVar(&o.readyAfter, "ready-after", 10*time.Minute, "a catch-up that takes less than this makes green ready for the cutover")
+	f.DurationVar(&o.readyAfter, "ready-after", 10*time.Minute, "a catch-up (copy plus verify) that takes less than this makes green ready for the cutover")
 	return cmd
 }
 
@@ -297,12 +297,12 @@ func (m *migrator) catchUpUntilCutover(ctx context.Context, syncer *migration.Sy
 		if err := syncer.Sync(ctx, start, began); err != nil {
 			return time.Time{}, err
 		}
-		took := m.now().Sub(began)
-		m.e.log.Info("synced up to now", "took", took.Round(time.Second))
+		m.e.log.Info("synced up to now", "took", m.now().Sub(began).Round(time.Second))
 		if err := m.verifyCopiedDays(ctx, syncer); err != nil {
 			return time.Time{}, err
 		}
-		if took < m.o.readyAfter && st.ReadyAt.IsZero() {
+		// Green is as far behind as the copy plus the verify took, including the days the verify copied again.
+		if took := m.now().Sub(began); took < m.o.readyAfter && st.ReadyAt.IsZero() {
 			if _, err := m.e.store.Update(ctx, func(st *state.State) { st.ReadyAt = m.now() }); err != nil {
 				return time.Time{}, err
 			}
@@ -317,13 +317,19 @@ func (m *migrator) catchUpUntilCutover(ctx context.Context, syncer *migration.Sy
 			return time.Time{}, err
 		}
 		switch {
+		case permanent(err):
+			return time.Time{}, err
 		case err != nil:
 			m.e.log.Warn("can't measure the writes, trying again after the next catch-up", "err", err, "retry", m.o.poll)
 			if err := m.sleep(ctx, m.o.poll); err != nil {
 				return time.Time{}, err
 			}
 		case w.Switched:
-			if pending := m.aliasesNotOnGreen(ctx); len(pending) > 0 {
+			pending, err := m.aliasesNotOnGreen(ctx)
+			if err != nil {
+				return time.Time{}, err
+			}
+			if len(pending) > 0 {
 				m.e.log.Info("the writers point at green, waiting for the aliases", "aliases", pending)
 				continue
 			}
@@ -338,7 +344,15 @@ func (m *migrator) catchUpUntilCutover(ctx context.Context, syncer *migration.Sy
 					return time.Time{}, err
 				}
 			}
-			if m.e.aliases.Configured() && len(m.aliasesNotOnGreen(ctx)) == 0 {
+			if !m.e.aliases.Configured() {
+				m.e.log.Info("waiting for the cutover", args...)
+				continue
+			}
+			pending, err := m.aliasesNotOnGreen(ctx)
+			if err != nil {
+				return time.Time{}, err
+			}
+			if w.BlueRate > 0 && len(pending) == 0 {
 				m.e.log.Warn("the aliases select green, but blue still receives rows: some writer bypasses the "+
 					"aliases; point it at green", args...)
 				continue
@@ -351,14 +365,18 @@ func (m *migrator) catchUpUntilCutover(ctx context.Context, syncer *migration.Sy
 // aliasesNotOnGreen returns why each configured alias doesn't select only green's pods yet. Readers that still
 // use blue would lose their data when blue is deleted, so migrate takes the cutover as done only when both the
 // writes and the aliases have moved.
-func (m *migrator) aliasesNotOnGreen(ctx context.Context) []string {
+// It returns an error only when waiting can't help, such as a missing permission to read an alias.
+func (m *migrator) aliasesNotOnGreen(ctx context.Context) ([]string, error) {
 	var pending []string
 	for _, r := range check.CheckAliases(ctx, m.e.aliases, m.e.blue, m.e.green, m.e.green, check.Fail) {
+		if permanent(r.Err) {
+			return nil, fmt.Errorf("%s: %w", r.Name, r.Err)
+		}
 		if r.Level != check.Pass {
 			pending = append(pending, r.Message)
 		}
 	}
-	return pending
+	return pending, nil
 }
 
 // backfillStart is where the first sync starts: --since, or now - blue's retention.

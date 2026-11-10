@@ -22,6 +22,7 @@ type fakeCluster struct {
 	samples float64
 	inserts []string
 	podGets []string
+	podsErr error // returned by Pods when set
 }
 
 func newFake(name string) *fakeCluster {
@@ -40,6 +41,9 @@ func (f *fakeCluster) Info() cluster.Info {
 }
 
 func (f *fakeCluster) Pods(_ context.Context, c cluster.Component) ([]corev1.Pod, error) {
+	if f.podsErr != nil {
+		return nil, f.podsErr
+	}
 	return []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{
 		Name: string(c) + "-" + f.name + "-0", Namespace: "monitoring",
 		Labels: map[string]string{"app.kubernetes.io/name": string(c), "app.kubernetes.io/instance": f.name},

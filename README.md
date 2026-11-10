@@ -52,7 +52,6 @@ Documentation:
   flags, rollback and troubleshooting.
 - [docs/architecture.md](docs/architecture.md): how the tool works, with diagrams, design decisions, state, the
   adaptive rate limit and metrics.
-- [docs/roadmap.md](docs/roadmap.md): what's done, what's next and the open decisions.
 
 ## How a migration runs
 
@@ -73,7 +72,7 @@ sync   [ backfill: now-retention ── now ][ catch-up ── Tc ]      [ final
 | 4. Install the chart | you | `helm install` with `from` and `to` (and the alias names). It can go into the same change as steps 2 and 3. |
 | 5. Preflight | tool | Waits until both VMClusters exist and every check passes: versions, flags, capacity, dual write, pod labels, aliases. |
 | 6. Backfill | tool | Copies `[now - retention, now]` in resumable chunks, then verifies every full day (a failed day is copied again once). This can take hours to days. |
-| 7. Catch-up | tool | Copies from the last synced point to now, again and again. When a run takes less than `--ready-after` (10m), it logs that green is ready for the cutover. |
+| 7. Catch-up | tool | Copies from the last synced point to now, again and again. When a run, copy plus verify, takes less than `--ready-after` (10m), it logs that green is ready for the cutover. |
 | 8. Cutover | you | Point the read and write aliases at green. |
 | 9. Final sync | tool | Notices the cutover (Tcut): blue receives no rows while green does, and the aliases select green. Waits until `Tcut + 15m`, checks that blue is drained (if blue still receives rows, it copies nothing and goes back to catch-up), copies `[last synced point - 1h, the moment blue was drained]`, waits 30s until green can search the rows, resets green's rollup cache and verifies. Then the Job completes. |
 | 10. Soak and delete | you | Keep blue for a few days so you can roll back, then delete blue and its PVCs. |

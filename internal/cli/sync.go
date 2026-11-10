@@ -52,9 +52,12 @@ func newSync(g *globalOptions) *cobra.Command {
 		Long: `sync copies data from --from into --to through the target's vminsert, one chunk (--step) at a time. Every
 finished chunk is recorded in the state, so a restarted run continues where the last one stopped.
 
-migrate runs the backfill, the catch-ups and the final sync by itself. Use sync for copies outside a migration:
-after a rollback, copy what green received since the cutover back to blue (swap --from and --to and start at the
-cutover with --since), or copy a range again with its own --state-file, --since and --until.
+migrate runs the backfill, the catch-ups and the final sync by itself. Use sync for copies outside a migration,
+or to copy a range again with its own --state-file, --since and --until.
+
+After a rollback, copy what green received since the switch back to blue: swap --from and --to, and set --since
+to a time before the switch, such as Ready in status if you switched after it. The copy overlaps what blue already
+has, so give blue's vmstorage and vmselect -dedup.minScrapeInterval=1ms first.
 
 The first run starts at --since (default: now - retention). Later runs continue from the last finished chunk up to
 --until.`,
